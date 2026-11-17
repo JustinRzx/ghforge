@@ -288,6 +288,63 @@ function ownedRepo(meta: MetaStore, login: string, owner: string, name: string):
   return meta.getRepo(owner, name);
 }
 
+/** Splits a git identity line (`Name <mail> <epoch> <tz>`) into its parts. */
+function identityOf(raw: string): { name: string; email: string; date: string } {
+  const match = /^(.*?) <(.*?)> (\d+) ([+-]\d{4})$/.exec(raw.trim());
+  if (match === null) {
+    return { name: raw.trim(), email: '', date: '' };
+  }
+  return {
+    name: match[1],
+    email: match[2],
+    date: new Date(Number(match[3]) * 1000).toISOString(),
+  };
+}
+
+/** The epoch a committer line carries, or 0 when it cannot be read. */
+function commitEpoch(raw: string): number {
+  const match = / (\d+) [+-]\d{4}$/.exec(raw.trim());
+  return match === null ? 0 : Number(match[1]);
+}
+
+/** One commit as the REST API renders it, in the `{sha, commit:{...}}` envelope the wire asks for. */
+function commitView(
+  sha: string,
+  commit: ReturnType<typeof parseCommit>,
+): Record<string, unknown> {
+  return {
+    sha,
+    commit: {
+      message: commit.message.replace(/\n+$/, ''),
+      author: identityOf(commit.author),
+      committer: identityOf(commit.committer),
+      tree: { sha: commit.tree },
+    },
+  };
+}
+
+/** Every commit a ref reaches, newest first. */
+function listCommits(
+  store: ForgeStore,
+  start: string,
+): Array<Record<string, unknown>> {
+  const seen = new Set<string>();
+  const queue = [start];
+  const rows: Array<{ row: Record<string, unknown>; at: number }> = [];
+  while (queue.length > 0) {
+    const sha = queue.shift() as string;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const obj = store.getObject(sha);
+    if (obj === null || obj.type !== 'commit') continue;
+    const commit = parseCommit(obj.body);
+    rows.push({ row: commitView(sha, commit), at: commitEpoch(commit.committer) });
+    for (const parent of commit.parents) queue.push(parent);
+  }
+  rows.sort((a, b) => b.at - a.at);
+  return rows.map((entry) => entry.row);
+}
+
 /** Serializes a blob entry into a GitHub contents object. */
 function contentObject(
   store: ForgeStore,
@@ -469,6 +526,8 @@ export async function handleRest(
       if (method === 'GET') {
         const issues = meta.listIssues(owner, repoName, {
           state: url.searchParams.get('state') ?? undefined,
+          sort: url.searchParams.get('sort') ?? undefined,
+          direction: url.searchParams.get('direction') ?? undefined,
           page: intParam(url, 'page', 1),
           per_page: intParam(url, 'per_page', 30),
         });
@@ -701,6 +760,21 @@ export async function handleRest(
       );
     }
 
+    // The history a ref reaches, newest first. `?sha=` names a branch or a commit id; without it the
+    // default branch is walked. GitHub answers the history here, not one commit.
+    if (restOf.length === 1 && restOf[0] === 'commits') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method !== 'GET') return json({ message: 'Not Found' }, 404, id);
+      const shaParam = url.searchParams.get('sha');
+      const start =
+        shaParam === null || shaParam === ''
+          ? store.resolveRef(`refs/heads/${repo.default_branch}`)
+          : (store.resolveRef(`refs/heads/${shaParam}`) ??
+            (store.getObject(shaParam) !== null ? shaParam : null));
+      if (start === null) return json({ message: 'Not Found' }, 404, id);
+      return json(listCommits(store, start), 200, id);
+    }
+
     if (restOf.length >= 1 && restOf[0] === 'contents') {
       if (!repo) return json({ message: 'Not Found' }, 404, id);
       const pathParts = restOf.slice(1).map((p) => decodeURIComponent(p));
@@ -711,8 +785,22 @@ export async function handleRest(
       if (method === 'GET') {
         if (tree === null) return json({ message: 'Not Found' }, 404, id);
         const entry = findInTree(store, tree, pathParts);
-        if (!entry || entry.mode === '40000' || entry.mode === '040000') {
-          return json({ message: 'Not Found' }, 404, id);
+        if (!entry) return json({ message: 'Not Found' }, 404, id);
+        if (entry.mode === '40000' || entry.mode === '040000') {
+          // A directory reads as a listing, not a 404: GitHub answers an array of the entries, each
+          // with its own type, path and object id.
+          const listing = store.readTree(entry.sha).map((child) => {
+            const isDir = child.mode === '40000' || child.mode === '040000';
+            const blob = isDir ? null : store.readBlob(child.sha);
+            return {
+              type: isDir ? 'dir' : 'file',
+              size: blob === null ? 0 : blob.length,
+              name: child.name,
+              path: [...pathParts, child.name].join('/'),
+              sha: child.sha,
+            };
+          });
+          return json(listing, 200, id);
         }
         const body = store.readBlob(entry.sha);
         if (body === null) return json({ message: 'Not Found' }, 404, id);

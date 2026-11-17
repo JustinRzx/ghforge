@@ -38,7 +38,7 @@ export interface Label {
 /** An issue record. */
 /** One comment on an issue or a pull request. */
 export interface IssueComment {
-  id: string;
+  id: number;
   body: string;
   user: { login: string };
   created_at: string;
@@ -78,6 +78,8 @@ export interface Pull {
   user: { login: string };
   created_at: string;
   mergeable: boolean;
+  /** The merge commit's id once merged, null before. */
+  merge_commit_sha: string | null;
   files: [];
 }
 
@@ -114,6 +116,10 @@ export interface CreateIssueInput {
 /** Filters and pagination for listing issues. */
 export interface ListIssuesInput {
   state?: string;
+  /** GitHub's `sort=created|updated`; only the creation order is modelled. */
+  sort?: string;
+  /** GitHub's `direction=asc|desc`; the default is newest first. */
+  direction?: string;
   page?: number;
   per_page?: number;
 }
@@ -414,7 +420,7 @@ export class MetaStore implements MetaStoreInterface {
     }
     this.commentSeq += 1;
     const comment: IssueComment = {
-      id: `${owner}/${repo}#${number}/comment/${this.commentSeq}`,
+      id: this.commentSeq,
       body,
       user: { login },
       created_at: new Date().toISOString(),
@@ -440,7 +446,13 @@ export class MetaStore implements MetaStoreInterface {
       if (input.state && input.state !== 'all' && issue.state !== input.state) continue;
       all.push(issue);
     }
-    all.sort((a, b) => b.number - a.number);
+    all.sort((a, b) => {
+      const byCreated = a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0;
+      const order = byCreated !== 0 ? byCreated : a.number - b.number;
+      // GitHub's default is newest first; `direction=asc` reverses it. Creation order is the only
+      // sort the suite drives, and issue numbers already ascend with creation.
+      return input.direction === 'asc' ? order : -order;
+    });
     const page = input.page ?? 1;
     const perPage = input.per_page ?? 30;
     const start = (page - 1) * perPage;
@@ -487,6 +499,7 @@ export class MetaStore implements MetaStoreInterface {
       user: { login: owner },
       created_at: now,
       mergeable: headSha !== '' && baseSha !== '',
+      merge_commit_sha: null,
       files: [],
     };
     this.pulls.set(pullKey(owner, repo, number), pull);
@@ -502,9 +515,11 @@ export class MetaStore implements MetaStoreInterface {
   listPulls(owner: string, repo: string, input: ListPullsInput): Pull[] {
     const prefix = `${owner}/${repo}/`;
     const result: Pull[] = [];
+    // GitHub's default list is the OPEN pull requests; `?state=all` is what widens it.
+    const state = input.state ?? 'open';
     for (const [key, pull] of this.pulls) {
       if (!key.startsWith(prefix)) continue;
-      if (input.state && input.state !== 'all' && pull.state !== input.state) continue;
+      if (state !== 'all' && pull.state !== state) continue;
       result.push(pull);
     }
     result.sort((a, b) => b.number - a.number);
@@ -525,6 +540,12 @@ export class MetaStore implements MetaStoreInterface {
     }
     const headObj = gitStore.getObject(headSha);
     if (headObj === null || headObj.type !== 'commit') {
+      return { error: 'conflict' };
+    }
+    // A squash merge only applies when the head still descends from the base. Once another pull
+    // request has been merged into the same base, the base tip is no longer an ancestor of this
+    // head, the change no longer applies cleanly, and GitHub answers 405 rather than merging.
+    if (!gitStore.isAncestor(baseSha, headSha)) {
       return { error: 'conflict' };
     }
     const tree = parseCommit(headObj.body).tree;
@@ -548,6 +569,7 @@ export class MetaStore implements MetaStoreInterface {
     pull.merged_at = new Date().toISOString();
     pull.head.sha = headSha;
     pull.base.sha = sha;
+    pull.merge_commit_sha = sha;
     return { sha, merged: true, message: 'Pull Request successfully merged' };
   }
 

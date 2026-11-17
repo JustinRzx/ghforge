@@ -1,5 +1,22 @@
 import type { ForgeStore } from './store.ts';
 import type { Issue, MetaStoreInterface, Pull, Repo } from './meta.ts';
+import { parseCommit } from './gitobj.ts';
+
+/**
+ * GitHub hands out an opaque global id: base64 of `<Type>:<databaseId>`. The counter this forge
+ * stores is the databaseId, and `node(id:)` decodes back to it, so a round trip is reproducible and
+ * the id a caller reads is never the bare databaseId.
+ */
+function toGlobalId(type: string, id: string | number): string {
+  return Buffer.from(`${type}:${id}`, 'utf8').toString('base64');
+}
+
+function fromGlobalId(globalId: string): { type: string; id: string } | null {
+  const decoded = Buffer.from(globalId, 'base64').toString('utf8');
+  const separator = decoded.indexOf(':');
+  if (separator <= 0) return null;
+  return { type: decoded.slice(0, separator), id: decoded.slice(separator + 1) };
+}
 
 type TypeKind = 'SCALAR' | 'OBJECT' | 'ENUM' | 'LIST' | 'NON_NULL';
 
@@ -421,10 +438,10 @@ const PULL_REQUEST_TYPE: TypeDef = {
     fieldDef('number', nonNull(INT)),
     fieldDef('headRefName', nonNull(STRING)),
     fieldDef('baseRefName', nonNull(STRING)),
-    fieldDef('mergeable', nonNull(BOOLEAN)),
+    fieldDef('mergeable', namedType('ENUM', 'MergeableState')),
     fieldDef('state', nonNull(STRING)),
     fieldDef('merged', nonNull(BOOLEAN)),
-    fieldDef('files', nonNull(listOf(nonNull(STRING)))),
+    fieldDef('files', nonNull(namedType('OBJECT', 'PullRequestChangedFileConnection'))),
   ],
 };
 
@@ -504,7 +521,16 @@ const QUERY_TYPE: TypeDef = {
   fields: [
     fieldDef('repository', namedType('OBJECT', 'Repository')),
     fieldDef('viewer', namedType('OBJECT', 'User')),
+    // The Relay node read: an opaque global id resolves to the object it names.
+    fieldDef('node', namedType('OBJECT', 'Node')),
   ],
+};
+
+/** The interface every node-resolvable object implements; only `id` is common. */
+const NODE_TYPE: TypeDef = {
+  kind: 'OBJECT',
+  name: 'Node',
+  fields: [fieldDef('id', nonNull(STRING))],
 };
 
 const SCHEMA_TYPES: TypeDef[] = [
@@ -513,6 +539,7 @@ const SCHEMA_TYPES: TypeDef[] = [
   PULL_REQUEST_TYPE,
   REPOSITORY_TYPE,
   SEARCH_TYPE,
+  NODE_TYPE,
   QUERY_TYPE,
 ];
 
@@ -536,11 +563,25 @@ const INTERNAL_TYPES: TypeDef[] = [
     fields: [fieldDef('oid', nonNull(STRING))],
   },
   {
+    kind: 'ENUM',
+    name: 'MergeableState',
+    enumValues: [{ name: 'MERGEABLE' }, { name: 'CONFLICTING' }, { name: 'UNKNOWN' }],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'PageInfo',
+    fields: [
+      fieldDef('hasNextPage', nonNull(BOOLEAN)),
+      fieldDef('endCursor', namedType('SCALAR', 'String')),
+    ],
+  },
+  {
     kind: 'OBJECT',
     name: 'IssueConnection',
     fields: [
       fieldDef('nodes', nonNull(listOf(nonNull(namedType('OBJECT', 'Issue'))))),
       fieldDef('totalCount', nonNull(INT)),
+      fieldDef('pageInfo', nonNull(namedType('OBJECT', 'PageInfo'))),
     ],
   },
   {
@@ -549,6 +590,21 @@ const INTERNAL_TYPES: TypeDef[] = [
     fields: [
       fieldDef('nodes', nonNull(listOf(nonNull(namedType('OBJECT', 'PullRequest'))))),
       fieldDef('totalCount', nonNull(INT)),
+      fieldDef('pageInfo', nonNull(namedType('OBJECT', 'PageInfo'))),
+    ],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'PullRequestChangedFile',
+    fields: [fieldDef('path', nonNull(STRING))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'PullRequestChangedFileConnection',
+    fields: [
+      fieldDef('nodes', nonNull(listOf(nonNull(namedType('OBJECT', 'PullRequestChangedFile'))))),
+      fieldDef('totalCount', nonNull(INT)),
+      fieldDef('pageInfo', nonNull(namedType('OBJECT', 'PageInfo'))),
     ],
   },
   {
@@ -860,9 +916,16 @@ function executeSelectionSet(
   }
 
   const result: Record<string, unknown> = {};
-  for (const field of collectFields(typeName, selections, context)) {
+  // An interface-typed field (`node`) resolves to a concrete object: dispatch on the object's own
+  // `__typename` so an inline fragment (`... on Repository { ... }`) selects that type's fields and
+  // resolvers instead of the interface's.
+  const declared = parent !== null && typeof parent === 'object'
+    ? (parent as Record<string, unknown>).__typename
+    : undefined;
+  const effective = typeof declared === 'string' && declared !== '' ? declared : typeName;
+  for (const field of collectFields(effective, selections, context)) {
     const responseKey = field.alias ?? field.name;
-    result[responseKey] = executeField(parent, typeName, field, context, [...path, responseKey]);
+    result[responseKey] = executeField(parent, effective, field, context, [...path, responseKey]);
   }
   return result;
 }
@@ -945,21 +1008,99 @@ function connectionResult<T>(
   items: T[],
   info: ResolveInfo,
   context: ExecContext,
-): T[] | { nodes: T[]; totalCount: number } {
+  args: Record<string, unknown> = {},
+): T[] | { nodes: T[]; totalCount: number; pageInfo: { hasNextPage: boolean; endCursor: string | null } } {
+  // Cursor paging: the cursor is the item's position in the ordered list, so `after` resumes exactly
+  // where the previous page stopped and `endCursor` is stable for the same data.
+  const first = typeof args.first === 'number' ? args.first : null;
+  const after = typeof args.after === 'string' && args.after !== '' ? Number(args.after) : null;
+  const start = after !== null && Number.isFinite(after) ? after + 1 : 0;
+  const page = first === null ? items.slice(start) : items.slice(start, start + first);
+  const hasNextPage = first !== null && start + first < items.length;
+  const pageInfo = {
+    hasNextPage,
+    endCursor: page.length === 0 ? null : String(start + page.length - 1),
+  };
   if (
     info.selectionSet &&
     (hasField(info.selectionSet, context, 'nodes') ||
-      hasField(info.selectionSet, context, 'totalCount'))
+      hasField(info.selectionSet, context, 'totalCount') ||
+      hasField(info.selectionSet, context, 'pageInfo'))
   ) {
-    return { nodes: items, totalCount: items.length };
+    return { nodes: page, totalCount: items.length, pageInfo };
   }
-  return items;
+  return page;
 }
 
 interface MetaInternals {
   repos?: Map<string, Repo>;
   pulls?: Map<string, Pull>;
   issues?: Map<string, Issue>;
+}
+
+/** The repository a pull request belongs to, read from the store's `owner/repo/number` key. */
+function locatePull(meta: MetaStoreInterface, pull: unknown): { owner: string; repo: string } | null {
+  const internals = meta as unknown as MetaInternals;
+  if (!(internals.pulls instanceof Map)) return null;
+  const target = pull as { id?: unknown };
+  for (const [key, candidate] of internals.pulls) {
+    if (candidate === pull || (target.id !== undefined && candidate.id === target.id)) {
+      const parts = key.split('/');
+      if (parts[0] && parts[1]) return { owner: parts[0], repo: parts[1] };
+    }
+  }
+  return null;
+}
+
+/** The tree object a branch name points at, or null. */
+function treeOfRef(store: ForgeStore, ref: unknown): string | null {
+  if (typeof ref !== 'string' || ref === '') return null;
+  const sha = store.resolveRef(`refs/heads/${ref}`);
+  if (sha === null) return null;
+  const obj = store.getObject(sha);
+  if (obj === null || obj.type !== 'commit') return null;
+  try {
+    return parseCommit(obj.body).tree;
+  } catch {
+    return null;
+  }
+}
+
+/** Every path whose blob differs between two trees, walked recursively. */
+function changedPaths(
+  store: ForgeStore,
+  baseTree: string | null,
+  headTree: string | null,
+): string[] {
+  const out: string[] = [];
+  const childMap = (
+    tree: string | null,
+  ): Map<string, { mode: string; sha: string }> => {
+    if (tree === null) return new Map();
+    try {
+      return new Map(store.readTree(tree).map((entry) => [entry.name, entry]));
+    } catch {
+      return new Map();
+    }
+  };
+  const isDir = (entry: { mode: string } | undefined): boolean =>
+    entry !== undefined && (entry.mode === '40000' || entry.mode === '040000');
+  const walk = (base: string | null, head: string | null, prefix: string): void => {
+    const left = childMap(base);
+    const right = childMap(head);
+    for (const name of new Set<string>([...left.keys(), ...right.keys()])) {
+      const l = left.get(name);
+      const r = right.get(name);
+      const path = prefix === '' ? name : `${prefix}/${name}`;
+      if (isDir(l) || isDir(r)) {
+        walk(isDir(l) ? (l as { sha: string }).sha : null, isDir(r) ? (r as { sha: string }).sha : null, path);
+        continue;
+      }
+      if (l === undefined || r === undefined || l.sha !== r.sha) out.push(path);
+    }
+  };
+  walk(baseTree, headTree, '');
+  return out.sort();
 }
 
 /**
@@ -969,6 +1110,10 @@ interface MetaInternals {
  * (see pullGlobalId), and falls back to scanning so an id minted any other way still resolves.
  */
 function findPullById(meta: MetaStoreInterface, id: string): { owner: string; repo: string; number: number } | null {
+  // A mutation input carries the opaque global id the caller read from us, so decode it back to the
+  // stored databaseId before matching; anything that is not a global id is matched as given.
+  const decoded = fromGlobalId(id);
+  if (decoded !== null && decoded.type === 'PullRequest') id = decoded.id;
   const match = /^([^/]+)\/([^#]+)#(\d+)$/.exec(id);
   if (match) {
     const owner = match[1] as string;
@@ -993,6 +1138,8 @@ function findPullById(meta: MetaStoreInterface, id: string): { owner: string; re
 
 /** Locates an issue from the global id a mutation input carries; same id shape as pulls. */
 function findIssueById(meta: MetaStoreInterface, id: string): { owner: string; repo: string; number: number } | null {
+  const decoded = fromGlobalId(id);
+  if (decoded !== null && decoded.type === 'Issue') id = decoded.id;
   const match = /^([^/]+)\/([^#]+)#(\d+)$/.exec(id);
   if (match) {
     const owner = match[1] as string;
@@ -1015,6 +1162,8 @@ function findIssueById(meta: MetaStoreInterface, id: string): { owner: string; r
 }
 
 function findRepoById(meta: MetaStoreInterface, id: string): Repo | null {
+  const decoded = fromGlobalId(id);
+  if (decoded !== null && decoded.type === 'Repository') id = decoded.id;
   const internals = meta as unknown as MetaInternals;
   if (internals.repos) {
     for (const repo of internals.repos.values()) {
@@ -1035,6 +1184,28 @@ const RESOLVERS: Record<string, Resolver> = {
     if (typeof login !== 'string' || login === '') return null;
     return context.meta.getUser(login) ?? context.meta.createUser(login);
   },
+  'Query.node': (_parent, args, context) => {
+    const globalId = typeof args.id === 'string' ? args.id : '';
+    const decoded = fromGlobalId(globalId);
+    if (decoded === null) return null;
+    if (decoded.type === 'Repository') {
+      const repo = findRepoById(context.meta, decoded.id);
+      return repo === null ? null : { ...repo, __typename: 'Repository' };
+    }
+    if (decoded.type === 'Issue') {
+      const located = findIssueById(context.meta, decoded.id);
+      if (located === null) return null;
+      const issue = context.meta.getIssue(located.owner, located.repo, located.number);
+      return issue === null ? null : { ...issue, __typename: 'Issue' };
+    }
+    if (decoded.type === 'PullRequest') {
+      const located = findPullById(context.meta, decoded.id);
+      if (located === null) return null;
+      const pull = context.meta.getPull(located.owner, located.repo, located.number);
+      return pull === null ? null : { ...pull, __typename: 'PullRequest' };
+    }
+    return null;
+  },
   'Query.repository': (_parent, args, context) => {
     const owner = typeof args.owner === 'string' ? args.owner : '';
     const name = typeof args.name === 'string' ? args.name : '';
@@ -1049,7 +1220,7 @@ const RESOLVERS: Record<string, Resolver> = {
     queryType: { name: 'Query' },
     types: SCHEMA_TYPES.map((type) => ({ kind: type.kind, name: type.name })),
   }),
-  'Repository.id': (parent: Repo) => parent.id,
+  'Repository.id': (parent: Repo) => toGlobalId('Repository', parent.id),
   'Repository.databaseId': (parent: Repo) => {
     const numeric = Number(parent.id);
     return Number.isFinite(numeric) ? Math.trunc(numeric) : null;
@@ -1079,31 +1250,48 @@ const RESOLVERS: Record<string, Resolver> = {
       page: 1,
       per_page: 10000,
     });
-    return connectionResult(sortByNumber(issues, args.orderBy), info, context);
+    return connectionResult(sortByNumber(issues, args.orderBy), info, context, args);
   },
   'Repository.pullRequests': (parent: Repo, args, context, info) => {
     const pulls = context.meta.listPulls(parent.owner.login, parent.name, {
       state: pullStateFilter(args.states),
     });
-    return connectionResult(sortByNumber(pulls, args.orderBy), info, context);
+    return connectionResult(sortByNumber(pulls, args.orderBy), info, context, args);
   },
   'Repository.pullRequest': (parent: Repo, args, context) => {
     const number = Number(args.number);
     if (!Number.isInteger(number)) return null;
     return context.meta.getPull(parent.owner.login, parent.name, number);
   },
-  'Issue.id': (parent: any) => parent.id,
+  'Issue.id': (parent: any) => toGlobalId('Issue', parent.id),
   'Issue.state': (parent: any) => String(parent.state).toUpperCase(),
-  'PullRequest.id': (parent: any) => parent.id,
+  'PullRequest.id': (parent: any) => toGlobalId('PullRequest', parent.id),
   'PullRequest.headRefName': (parent: any) => parent.head?.ref ?? '',
   'PullRequest.baseRefName': (parent: any) => parent.base?.ref ?? '',
-  'PullRequest.mergeable': (parent: any) => Boolean(parent.mergeable),
+  // The schema's mergeable is the MergeableState enum, not a boolean: an entry that has no head or
+  // base cannot be judged, which is UNKNOWN; otherwise the recorded bit decides.
+  'PullRequest.mergeable': (parent: any) => {
+    const head = parent?.head?.sha;
+    const base = parent?.base?.sha;
+    if (head === undefined || head === '' || base === undefined || base === '') return 'UNKNOWN';
+    return parent.mergeable === true ? 'MERGEABLE' : 'CONFLICTING';
+  },
   'PullRequest.state': (parent: any) => {
-    const state = String(parent.state).toLowerCase();
+    // The recorded bit is the truth: a merged pull is MERGED even though its REST state closes.
+    if (parent?.merged === true) return 'MERGED';
+    const state = String(parent?.state ?? '').toLowerCase();
     return state === 'merged' ? 'MERGED' : state.toUpperCase();
   },
   'PullRequest.merged': (parent: any) => Boolean(parent.merged),
-  'PullRequest.files': (parent: any) => (Array.isArray(parent.files) ? parent.files : []),
+  'PullRequest.files': (parent: any, args, context, info) => {
+    const located = locatePull(context.meta, parent);
+    if (located === null) return connectionResult([], info, context, args);
+    // The tree of each branch lives in this repository's own store, so the diff is real: a pull whose
+    // head changed a path lists that path and nothing the two branches already share.
+    const store = context.meta.repoStore(located.owner, located.repo);
+    const paths = changedPaths(store, treeOfRef(store, parent?.base?.ref), treeOfRef(store, parent?.head?.ref));
+    return connectionResult(paths.map((path) => ({ path })), info, context, args);
+  },
   'Mutation.mergePullRequest': (_parent, args, context) => {
     const input = args.input;
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -1164,13 +1352,13 @@ const RESOLVERS: Record<string, Resolver> = {
     if (issue) {
       const comment = context.meta.createIssueComment(issue.owner, issue.repo, issue.number, body);
       if (!comment) return { commentEdge: null };
-      return { commentEdge: { node: { id: comment.id, body: comment.body } } };
+      return { commentEdge: { node: { id: toGlobalId('IssueComment', comment.id), body: comment.body } } };
     }
     const pull = findPullById(context.meta, subjectId);
     if (pull) {
       const comment = context.meta.createIssueComment(pull.owner, pull.repo, pull.number, body);
       if (!comment) return { commentEdge: null };
-      return { commentEdge: { node: { id: comment.id, body: comment.body } } };
+      return { commentEdge: { node: { id: toGlobalId('IssueComment', comment.id), body: comment.body } } };
     }
     return { commentEdge: null };
   },
@@ -1234,62 +1422,63 @@ export async function handleGraphQL(
     });
   }
 
-  const requestBody =
-    body && typeof body === 'object' && !Array.isArray(body)
-      ? (body as Record<string, unknown>)
-      : {};
-  const query = typeof requestBody.query === 'string' ? requestBody.query : '';
-  const providedVariables =
-    requestBody.variables &&
-    typeof requestBody.variables === 'object' &&
-    !Array.isArray(requestBody.variables)
-      ? (requestBody.variables as Record<string, unknown>)
-      : {};
+  // One `{query, variables}` object to one payload object. A batched request is an ARRAY of those
+  // objects and answers an ARRAY of payloads, position for position, so the caller can pair them up.
+  const runBody = (candidate: unknown): unknown => {
+    const requestBody =
+      candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        ? (candidate as Record<string, unknown>)
+        : {};
+    const query = typeof requestBody.query === 'string' ? requestBody.query : '';
+    const providedVariables =
+      requestBody.variables &&
+      typeof requestBody.variables === 'object' &&
+      !Array.isArray(requestBody.variables)
+        ? (requestBody.variables as Record<string, unknown>)
+        : {};
 
-  let definitions: Definition[];
-  try {
-    definitions = new Parser(tokenize(query)).parseDocument();
-  } catch (error) {
-    return new Response(
-      JSON.stringify({
+    let definitions: Definition[];
+    try {
+      definitions = new Parser(tokenize(query)).parseDocument();
+    } catch (error) {
+      return {
         errors: [
           {
             message: error instanceof Error ? error.message : String(error),
             path: [],
           },
         ],
-      }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
+      };
+    }
+
+    const operations = definitions.filter(
+      (definition): definition is OperationDefinition => definition.kind === 'operation',
     );
-  }
+    const fragments = new Map<string, FragmentDefinition>();
+    for (const definition of definitions) {
+      if (definition.kind === 'fragment') fragments.set(definition.name, definition);
+    }
 
-  const operations = definitions.filter(
-    (definition): definition is OperationDefinition => definition.kind === 'operation',
-  );
-  const fragments = new Map<string, FragmentDefinition>();
-  for (const definition of definitions) {
-    if (definition.kind === 'fragment') fragments.set(definition.name, definition);
-  }
+    if (operations.length === 0) {
+      return { errors: [{ message: 'No operation found', path: [] }] };
+    }
 
-  if (operations.length === 0) {
-    return new Response(
-      JSON.stringify({ errors: [{ message: 'No operation found', path: [] }] }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    );
-  }
+    const results = operations.map((operation) => {
+      const context: ExecContext = {
+        store,
+        meta,
+        login: tokenLogin(),
+        variables: buildVariables(operation, providedVariables),
+        fragments,
+      };
+      return executeOperation(operation, context);
+    });
 
-  const results = operations.map((operation) => {
-    const context: ExecContext = {
-      store,
-      meta,
-      login: tokenLogin(),
-      variables: buildVariables(operation, providedVariables),
-      fragments,
-    };
-    return executeOperation(operation, context);
-  });
+    return results.length === 1 ? results[0] : results;
+  };
 
-  const payload = results.length === 1 ? results[0] : results;
+  const batch = Array.isArray(body);
+  const payload = batch ? (body as unknown[]).map((entry) => runBody(entry)) : runBody(body);
   return new Response(JSON.stringify(payload), {
     status: 200,
     headers: { 'content-type': 'application/json' },

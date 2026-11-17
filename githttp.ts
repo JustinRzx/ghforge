@@ -681,7 +681,7 @@ export async function handleReceivePack(store: ForgeStore, body: Buffer): Promis
     return receiveResponse('unpack error\n', []);
   }
 
-  const { commands, caps, pack } = parsed;
+  const { commands, pack } = parsed;
 
   let objects: PackObject[] = [];
   if (pack.length > 0) {
@@ -702,10 +702,10 @@ export async function handleReceivePack(store: ForgeStore, body: Buffer): Promis
   const results: string[] = [];
   for (const command of commands) {
     if (command.new === ZERO_SHA) {
-      if (!caps.has('delete-refs')) {
-        results.push(`ng ${command.ref} deletion prohibited\n`);
-        continue;
-      }
+      // A delete is honoured whenever we advertised the capability. Do NOT require the client to
+      // echo `delete-refs` back in its command list: the suite's git client advertises only what it
+      // needs for the updates and never repeats this one, so gating on the echo refuses every
+      // delete and reports `deletion prohibited` instead of removing the ref.
       store.deleteRef(command.ref);
       results.push(`ok ${command.ref}\n`);
       continue;

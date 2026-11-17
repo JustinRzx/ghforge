@@ -98,7 +98,10 @@ function toRequest(req: IncomingMessage, body: Buffer): Request {
 
   return {
     method,
-    url: `http://127.0.0.1${req.url ?? '/'}`,
+    // The synthetic URL keeps the caller's own Host (address AND port), so anything the app derives
+    // from `url.origin` -- a pagination Link header above all -- stays on the entry's origin. A
+    // hardcoded host drops the port and the suite refuses a Link that leaves its origin.
+    url: `http://${raw.host ?? '127.0.0.1'}${req.url ?? '/'}`,
     headers,
     arrayBuffer: async (): Promise<ArrayBuffer> =>
       body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer,

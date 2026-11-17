@@ -308,7 +308,13 @@ function dispatch(
       return {
         kind: 'response',
         sessionId,
-        body: rpcResult(id, { supportedVersions: SUPPORTED_VERSIONS, serverInfo: SERVER_INFO }),
+        body: rpcResult(id, {
+          supportedVersions: SUPPORTED_VERSIONS,
+          serverInfo: SERVER_INFO,
+          // `server/discover` declares the same capabilities the legacy handshake does: a caller that
+          // negotiated the modern era reads `capabilities.tools` here, not from `initialize`.
+          capabilities: { tools: {} },
+        }),
       };
     case 'ping':
       return { kind: 'response', sessionId, body: rpcResult(id, {}) };

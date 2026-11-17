@@ -44,6 +44,13 @@ export interface IssueComment {
   created_at: string;
 }
 
+/** A label as the REST API renders it: only the name is required by the suite's shape. */
+export interface IssueLabelView {
+  name: string;
+  color?: string;
+  description?: string | null;
+}
+
 export interface Issue {
   id: string;
   number: number;

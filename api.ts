@@ -6,6 +6,7 @@ import {
   parseCommit,
 } from './gitobj.ts';
 import { MetaStore, type Repo } from './meta.ts';
+import type { Issue } from './meta.ts';
 import type { ForgeStore } from './store.ts';
 
 const EMPTY_TREE_SHA = hashObject('tree', Buffer.alloc(0));
@@ -73,6 +74,18 @@ function intParam(url: URL, key: string, fallback: number): number {
   if (raw === null) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Renders an issue the way the REST API reports it.
+ *
+ * Stored labels are names; GitHub sends back label objects, and callers read `.name` from them.
+ */
+function issueView(issue: Issue): Record<string, unknown> {
+  return {
+    ...issue,
+    labels: issue.labels.map((name) => ({ name })),
+  };
 }
 
 /** Resolves a commit id to its root tree id, or null when the id is not a commit. */
@@ -459,7 +472,7 @@ export async function handleRest(
           page: intParam(url, 'page', 1),
           per_page: intParam(url, 'per_page', 30),
         });
-        return json(issues, 200, id);
+        return json(issues.map(issueView), 200, id);
       }
       if (method === 'POST') {
         const body = await readBody(req);
@@ -481,7 +494,7 @@ export async function handleRest(
         if (!issue) {
           return json({ message: 'Validation Failed' }, 422, id);
         }
-        return json(issue, 201, id);
+        return json(issueView(issue), 201, id);
       }
       return json({ message: 'Not Found' }, 404, id);
     }
@@ -492,7 +505,7 @@ export async function handleRest(
       if (!Number.isInteger(number)) return json({ message: 'Not Found' }, 404, id);
       if (method === 'GET') {
         const issue = meta.getIssue(owner, repoName, number);
-        return issue ? json(issue, 200, id) : json({ message: 'Not Found' }, 404, id);
+        return issue ? json(issueView(issue), 200, id) : json({ message: 'Not Found' }, 404, id);
       }
       if (method === 'PATCH') {
         const body = await readBody(req);
@@ -509,7 +522,7 @@ export async function handleRest(
             ? patch.labels.filter((l): l is string => typeof l === 'string')
             : undefined,
         });
-        return updated ? json(updated, 200, id) : json({ message: 'Not Found' }, 404, id);
+        return updated ? json(issueView(updated), 200, id) : json({ message: 'Not Found' }, 404, id);
       }
       return json({ message: 'Not Found' }, 404, id);
     }

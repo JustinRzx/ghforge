@@ -75,6 +75,106 @@ function intParam(url: URL, key: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** Resolves a commit id to its root tree id, or null when the id is not a commit. */
+function commitTree(store: ForgeStore, commitSha: string | null): string | null {
+  if (commitSha === null) return null;
+  const obj = store.getObject(commitSha);
+  if (obj === null || obj.type !== 'commit') return null;
+  return parseCommit(obj.body).tree;
+}
+
+/**
+ * Flattens a tree to a path -> blob id map.
+ *
+ * The pull-request file list compares whole trees, so subtrees are walked rather than compared
+ * as single entries: two trees differ if any blob deep inside them differs.
+ */
+function flattenTree(store: ForgeStore, treeSha: string | null, prefix = '', into = new Map<string, string>()): Map<string, string> {
+  if (treeSha === null) return into;
+  for (const entry of store.readTree(treeSha)) {
+    const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.mode === '40000' || entry.mode === '040000') {
+      flattenTree(store, entry.sha, path, into);
+    } else {
+      into.set(path, entry.sha);
+    }
+  }
+  return into;
+}
+
+/** Counts the lines one blob adds and removes against another; binary blobs count as 0/0. */
+function countLineChanges(before: Buffer | null, after: Buffer | null): { additions: number; deletions: number } {
+  const isBinary = (buf: Buffer | null): boolean =>
+    buf !== null && buf.subarray(0, 8000).includes(0);
+  if (isBinary(before) || isBinary(after)) return { additions: 0, deletions: 0 };
+
+  const lines = (buf: Buffer | null): string[] =>
+    buf === null ? [] : buf.toString('utf8').split('\n');
+  const beforeLines = lines(before);
+  const afterLines = lines(after);
+
+  // Longest common subsequence over lines, trimmed from both ends first so the table stays small.
+  let start = 0;
+  while (start < beforeLines.length && start < afterLines.length && beforeLines[start] === afterLines[start]) {
+    start += 1;
+  }
+  let endBefore = beforeLines.length;
+  let endAfter = afterLines.length;
+  while (endBefore > start && endAfter > start && beforeLines[endBefore - 1] === afterLines[endAfter - 1]) {
+    endBefore -= 1;
+    endAfter -= 1;
+  }
+
+  const a = beforeLines.slice(start, endBefore);
+  const b = afterLines.slice(start, endAfter);
+  if (a.length === 0 || b.length === 0) {
+    return { additions: b.length, deletions: a.length };
+  }
+
+  const table: number[][] = [];
+  for (let i = 0; i <= a.length; i += 1) table.push(new Array<number>(b.length + 1).fill(0));
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      table[i][j] =
+        a[i - 1] === b[j - 1]
+          ? (table[i - 1][j - 1] as number) + 1
+          : Math.max(table[i - 1][j] as number, table[i][j - 1] as number);
+    }
+  }
+  const common = table[a.length][b.length] as number;
+  return { additions: b.length - common, deletions: a.length - common };
+}
+
+/** The files that differ between two trees, shaped the way the pull-request files endpoint reports. */
+function diffTrees(store: ForgeStore, baseTree: string | null, headTree: string | null): unknown[] {
+  const before = flattenTree(store, baseTree);
+  const after = flattenTree(store, headTree);
+  const paths = new Set<string>([...before.keys(), ...after.keys()]);
+  const files: unknown[] = [];
+
+  for (const path of [...paths].sort()) {
+    const beforeSha = before.get(path) ?? null;
+    const afterSha = after.get(path) ?? null;
+    if (beforeSha === afterSha) continue;
+
+    const beforeBody = beforeSha === null ? null : store.readBlob(beforeSha);
+    const afterBody = afterSha === null ? null : store.readBlob(afterSha);
+    const status = beforeSha === null ? 'added' : afterSha === null ? 'removed' : 'modified';
+    const { additions, deletions } = countLineChanges(beforeBody, afterBody);
+    files.push({
+      filename: path,
+      status,
+      additions,
+      deletions,
+      changes: additions + deletions,
+      blob_url: '',
+      raw_url: '',
+      contents_url: '',
+    });
+  }
+  return files;
+}
+
 /** Resolves the tree object id at the head of a repository's default branch. */
 function headTree(store: ForgeStore, repo: Repo): string | null {
   const headSha = store.resolveRef(`refs/heads/${repo.default_branch}`);
@@ -458,6 +558,20 @@ export async function handleRest(
       return json({ message: 'Not Found' }, 404, id);
     }
 
+    // The files a pull request changes: the diff between the base and head branch trees,
+    // reported the way GitHub reports it (filename, status, additions, deletions).
+    if (restOf.length === 3 && restOf[0] === 'pulls' && restOf[2] === 'files') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method !== 'GET') return json({ message: 'Not Found' }, 404, id);
+      const number = Number.parseInt(restOf[1], 10);
+      if (!Number.isInteger(number)) return json({ message: 'Not Found' }, 404, id);
+      const pull = meta.getPull(owner, repoName, number);
+      if (!pull) return json({ message: 'Not Found' }, 404, id);
+      const baseTree = commitTree(store, store.resolveRef(`refs/heads/${pull.base.ref}`));
+      const headTree = commitTree(store, store.resolveRef(`refs/heads/${pull.head.ref}`));
+      return json(diffTrees(store, baseTree, headTree), 200, id);
+    }
+
     if (restOf.length === 3 && restOf[0] === 'pulls' && restOf[2] === 'merge') {
       if (!repo) return json({ message: 'Not Found' }, 404, id);
       if (method !== 'PUT') return json({ message: 'Not Found' }, 404, id);
@@ -553,7 +667,9 @@ export async function handleRest(
     if (restOf.length >= 1 && restOf[0] === 'contents') {
       if (!repo) return json({ message: 'Not Found' }, 404, id);
       const pathParts = restOf.slice(1).map((p) => decodeURIComponent(p));
-      const tree = headTree(store, repo);
+      // Reads honour ?ref= (a branch name or commit id); without it the default branch is read.
+      const refParam = url.searchParams.get('ref');
+      const tree = refParam === null ? headTree(store, repo) : commitTree(store, store.resolveRef(`refs/heads/${refParam}`) ?? (store.getObject(refParam) !== null ? refParam : null));
 
       if (method === 'GET') {
         if (tree === null) return json({ message: 'Not Found' }, 404, id);
@@ -573,7 +689,17 @@ export async function handleRest(
         if (typeof input.content !== 'string' || typeof input.message !== 'string') {
           return json({ message: 'Invalid contents payload' }, 400, id);
         }
-        const existing = tree === null ? null : findInTree(store, tree, pathParts);
+        // The body's `branch` (or ?ref=) picks which branch the commit lands on; without it the
+        // repository's default branch is used, which is what a bare contents PUT means.
+        const branch =
+          typeof input.branch === 'string' && input.branch !== ''
+            ? input.branch
+            : (url.searchParams.get('ref') ?? repo.default_branch);
+        const branchSha = store.resolveRef(`refs/heads/${branch}`);
+        // A repository created with auto_init false has no branch yet: the first contents write is
+        // what creates it, so a missing branch is an empty tree rather than an error.
+        const branchTree = branchSha === null ? null : commitTree(store, branchSha);
+        const existing = branchTree === null ? null : findInTree(store, branchTree, pathParts);
         if (typeof input.sha === 'string') {
           if (!existing || existing.sha !== input.sha) {
             return json({ message: 'sha does not match' }, 409, id);
@@ -581,10 +707,9 @@ export async function handleRest(
         }
         const blob = Buffer.from(input.content.replace(/\s+/g, ''), 'base64');
         const blobSha = store.putObject('blob', blob);
-        const newTree = writeBlobAtPath(store, tree ?? EMPTY_TREE_SHA, pathParts, blobSha);
-        const headSha = store.resolveRef(`refs/heads/${repo.default_branch}`);
-        const commitSha = buildCommit(store, login, newTree, headSha, input.message);
-        store.setRef(`refs/heads/${repo.default_branch}`, commitSha);
+        const newTree = writeBlobAtPath(store, branchTree ?? EMPTY_TREE_SHA, pathParts, blobSha);
+        const commitSha = buildCommit(store, login, newTree, branchSha, input.message);
+        store.setRef(`refs/heads/${branch}`, commitSha);
         const status = existing ? 200 : 201;
         return json(
           {

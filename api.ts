@@ -471,6 +471,85 @@ export async function handleRest(
       return json(result, 200, id);
     }
 
+    // Git refs: the branch-creation and deletion surface the pull fixtures and the branch
+    // listing both drive. A ref is created against an existing commit; the reply is the ref.
+    if (restOf.length >= 2 && restOf[0] === 'git' && restOf[1] === 'refs') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      const refName = restOf.slice(2).map((p) => decodeURIComponent(p)).join('/');
+
+      if (method === 'POST' && restOf.length === 2) {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (typeof input.ref !== 'string' || typeof input.sha !== 'string') {
+          return json({ message: 'Invalid ref payload' }, 422, id);
+        }
+        if (!input.ref.startsWith('refs/')) {
+          return json({ message: 'ref must start with refs/' }, 422, id);
+        }
+        if (store.getObject(input.sha) === null) {
+          return json({ message: 'Object does not exist' }, 422, id);
+        }
+        if (store.getRef(input.ref) !== null) {
+          return json({ message: 'Reference already exists' }, 422, id);
+        }
+        store.setRef(input.ref, input.sha);
+        return json({ ref: input.ref, object: { sha: input.sha, type: 'commit' } }, 201, id);
+      }
+
+      if (restOf.length >= 3) {
+        const target = `refs/${refName}`;
+        if (method === 'GET') {
+          const sha = store.getRef(target);
+          if (sha === null) return json({ message: 'Not Found' }, 404, id);
+          return json({ ref: target, object: { sha, type: 'commit' } }, 200, id);
+        }
+        if (method === 'PATCH') {
+          const body = await readBody(req);
+          if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+          const input = body.value as Record<string, unknown>;
+          if (typeof input.sha !== 'string' || store.getObject(input.sha) === null) {
+            return json({ message: 'Object does not exist' }, 422, id);
+          }
+          store.setRef(target, input.sha);
+          return json({ ref: target, object: { sha: input.sha, type: 'commit' } }, 200, id);
+        }
+        if (method === 'DELETE') {
+          if (store.getRef(target) === null) return json({ message: 'Not Found' }, 404, id);
+          store.deleteRef(target);
+          return new Response(null, { status: 204, headers: { 'X-GitHub-Request-Id': id } });
+        }
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    // Branches: the branch list the repository checks read.
+    if (restOf.length >= 1 && restOf[0] === 'branches') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method !== 'GET') return json({ message: 'Not Found' }, 404, id);
+      const prefix = 'refs/heads/';
+      if (restOf.length === 1) {
+        const branches: unknown[] = [];
+        for (const entry of store.listRefs()) {
+          if (!entry.name.startsWith(prefix)) continue;
+          branches.push({
+            name: entry.name.slice(prefix.length),
+            commit: { sha: store.resolveRef(entry.name) ?? '' },
+            protected: entry.name.slice(prefix.length) === repo.default_branch,
+          });
+        }
+        return json(branches, 200, id);
+      }
+      const name = restOf.slice(1).map((p) => decodeURIComponent(p)).join('/');
+      const sha = store.resolveRef(`${prefix}${name}`);
+      if (sha === null) return json({ message: 'Branch not found' }, 404, id);
+      return json(
+        { name, commit: { sha }, protected: name === repo.default_branch },
+        200,
+        id,
+      );
+    }
+
     if (restOf.length >= 1 && restOf[0] === 'contents') {
       if (!repo) return json({ message: 'Not Found' }, 404, id);
       const pathParts = restOf.slice(1).map((p) => decodeURIComponent(p));

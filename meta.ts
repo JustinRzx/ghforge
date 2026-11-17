@@ -233,19 +233,6 @@ export class MetaStore implements MetaStoreInterface {
       has_issues: true,
     };
     this.repos.set(key, repo);
-
-    // Seed the default branch with a root commit over an empty tree, so the repository is
-    // clonable and its default_branch resolves before the first push.
-    const gitStore = this.repoStore(owner.login, input.name);
-    const emptyTree = gitStore.putObject('tree', Buffer.alloc(0));
-    const ident = this.ident(owner.login);
-    const rootCommit = gitStore.putObject(
-      'commit',
-      Buffer.from(`tree ${emptyTree}\nauthor ${ident}\ncommitter ${ident}\n\nInitial commit\n`),
-    );
-    gitStore.setRef('refs/heads/main', rootCommit);
-    gitStore.setRef('HEAD', 'ref: refs/heads/main');
-
     return repo;
   }
 

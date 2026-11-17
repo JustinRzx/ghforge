@@ -160,7 +160,7 @@ function uploadAdvertisement(store: ForgeStore, isV2: boolean): Buffer {
     ]);
   }
 
-  const caps = 'side-band-64k ofs-delta symref=HEAD:refs/heads/main agent=ghforge/1.0';
+  const caps = 'side-band-64k ofs-delta delete-refs symref=HEAD:refs/heads/main agent=ghforge/1.0';
   const refs = resolvedRefs(store, true);
   const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), flushPkt()];
   if (refs.length === 0) {
@@ -213,12 +213,12 @@ export function handleInfoRefs(
   };
 }
 
-function collectReachable(store: ForgeStore, roots: Iterable<string>): Map<string, PackObject> {
+function collectReachable(store: ForgeStore, roots: Iterable<string>, depth = 0): Map<string, PackObject> {
   const result = new Map<string, PackObject>();
   const seen = new Set<string>();
-  const stack = [...roots];
+  const stack: Array<{ sha: string; level: number }> = [...roots].map((sha) => ({ sha, level: 0 }));
   while (stack.length > 0) {
-    const sha = stack.pop() as string;
+    const { sha, level } = stack.pop() as { sha: string; level: number };
     if (seen.has(sha)) {
       continue;
     }
@@ -228,6 +228,9 @@ function collectReachable(store: ForgeStore, roots: Iterable<string>): Map<strin
       continue;
     }
     result.set(sha, { sha, type: obj.type, body: obj.body });
+    // A finite depth stops the walk at the commit boundary: the pack holds `depth` generations and
+    // their trees/blobs, but no older commit. Trees and tags are always walked in full.
+    const nextLevel = level + 1;
     if (obj.type === 'commit') {
       let commit;
       try {
@@ -235,9 +238,11 @@ function collectReachable(store: ForgeStore, roots: Iterable<string>): Map<strin
       } catch {
         continue;
       }
-      stack.push(commit.tree);
-      for (const parent of commit.parents) {
-        stack.push(parent);
+      stack.push({ sha: commit.tree, level: nextLevel });
+      if (depth === 0 || nextLevel < depth) {
+        for (const parent of commit.parents) {
+          stack.push({ sha: parent, level: nextLevel });
+        }
       }
     } else if (obj.type === 'tree') {
       let entries;
@@ -247,16 +252,53 @@ function collectReachable(store: ForgeStore, roots: Iterable<string>): Map<strin
         continue;
       }
       for (const entry of entries) {
-        stack.push(entry.sha);
+        stack.push({ sha: entry.sha, level: nextLevel });
       }
     } else if (obj.type === 'tag') {
       const line = obj.body.toString('utf8').split('\n')[0];
       if (line.startsWith('object ')) {
-        stack.push(line.slice(7).trim());
+        stack.push({ sha: line.slice(7).trim(), level: nextLevel });
       }
     }
   }
   return result;
+}
+
+/** The commits a shallow fetch must name in its `shallow` lines: the ones whose parents are cut off. */
+function shallowBoundary(store: ForgeStore, wants: string[], depth: number): string[] {
+  const included = collectReachable(store, wants, depth);
+  const boundary: string[] = [];
+  for (const [sha, obj] of included) {
+    if (obj.type !== 'commit') {
+      continue;
+    }
+    let commit;
+    try {
+      commit = parseCommit(obj.body);
+    } catch {
+      continue;
+    }
+    if (commit.parents.some((parent) => !included.has(parent))) {
+      boundary.push(sha);
+    }
+  }
+  return boundary;
+}
+
+/** The `depth N` a fetch asked for, or 0 for a full fetch. */
+function requestedDepth(lines: string[]): number {
+  for (const line of lines) {
+    if (line.startsWith('deepen ')) {
+      const value = Number.parseInt(line.slice('deepen '.length).trim(), 10);
+      if (Number.isFinite(value) && value > 0) {
+        return value;
+      }
+    }
+    if (line.startsWith('deepen-since ') || line.startsWith('deepen-not ')) {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 function encodePackEntry(type: GitObjType, body: Buffer): Buffer {
@@ -280,8 +322,8 @@ function encodePackEntry(type: GitObjType, body: Buffer): Buffer {
   return Buffer.concat([Buffer.from(header), deflate(body)]);
 }
 
-function buildPack(store: ForgeStore, wants: string[], haves: string[]): Buffer {
-  const wanted = collectReachable(store, wants);
+function buildPack(store: ForgeStore, wants: string[], haves: string[], depth = 0): Buffer {
+  const wanted = collectReachable(store, wants, depth);
   const excluded = collectReachable(store, haves);
   const objects = [...wanted.values()].filter((obj) => !excluded.has(obj.sha));
 
@@ -354,15 +396,34 @@ function buildLsRefs(store: ForgeStore, lines: string[]): Buffer {
 function buildFetchV2(store: ForgeStore, lines: string[]): Buffer {
   const wants = parseWantHave(lines, 'want');
   const haves = parseWantHave(lines, 'have');
-  const pack = buildPack(store, wants, haves);
-  return Buffer.concat([pktLine('packfile\n'), ...sideband(pack), flushPkt()]);
+  const depth = requestedDepth(lines);
+  const pack = buildPack(store, wants, haves, depth);
+  const parts: Buffer[] = [];
+  if (depth > 0) {
+    const boundary = shallowBoundary(store, wants, depth);
+    parts.push(pktLine('shallow-info\n'));
+    for (const sha of boundary) {
+      parts.push(pktLine(`shallow ${sha}\n`));
+    }
+    parts.push(delimPkt());
+  }
+  parts.push(pktLine('packfile\n'), ...sideband(pack), flushPkt());
+  return Buffer.concat(parts);
 }
 
 function buildFetchV0(store: ForgeStore, lines: string[]): Buffer {
   const wants = parseWantHave(lines, 'want');
   const haves = parseWantHave(lines, 'have');
-  const pack = buildPack(store, wants, haves);
-  return Buffer.concat([pktLine('NAK\n'), ...sideband(pack), flushPkt()]);
+  const depth = requestedDepth(lines);
+  const pack = buildPack(store, wants, haves, depth);
+  const parts: Buffer[] = [];
+  if (depth > 0) {
+    for (const sha of shallowBoundary(store, wants, depth)) {
+      parts.push(pktLine(`shallow ${sha}\n`));
+    }
+  }
+  parts.push(pktLine('NAK\n'), ...sideband(pack), flushPkt());
+  return Buffer.concat(parts);
 }
 
 /** Handles a git-upload-pack POST body, supporting both protocol v0 and v2. */
@@ -657,6 +718,11 @@ export async function handleReceivePack(store: ForgeStore, body: Buffer): Promis
 
     try {
       store.setRef(command.ref, command.new);
+      // The first branch a repository receives becomes its default: HEAD must point at it, or
+      // every ls-refs/clone sees an unborn HEAD. A new repo starts with no HEAD ref at all.
+      if (store.getRef('HEAD') === null && command.ref.startsWith('refs/heads/')) {
+        store.setRef('HEAD', `ref: ${command.ref}`);
+      }
       results.push(`ok ${command.ref}\n`);
     } catch {
       results.push(`ng ${command.ref} non-fast-forward\n`);

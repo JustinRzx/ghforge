@@ -517,12 +517,13 @@ export class MetaStore implements MetaStoreInterface {
     if (!pull) {
       return { error: 'not_found' };
     }
-    const headSha = this.store.resolveRef(`refs/heads/${pull.head.ref}`);
-    const baseSha = this.store.resolveRef(`refs/heads/${pull.base.ref}`);
+    const gitStore = this.repoStore(owner, repo);
+    const headSha = gitStore.resolveRef(`refs/heads/${pull.head.ref}`);
+    const baseSha = gitStore.resolveRef(`refs/heads/${pull.base.ref}`);
     if (headSha === null || baseSha === null) {
       return { error: 'conflict' };
     }
-    const headObj = this.store.getObject(headSha);
+    const headObj = gitStore.getObject(headSha);
     if (headObj === null || headObj.type !== 'commit') {
       return { error: 'conflict' };
     }
@@ -536,13 +537,13 @@ export class MetaStore implements MetaStoreInterface {
       committer: ident,
       message,
     });
-    const sha = this.store.putObject('commit', commit);
+    const sha = gitStore.putObject('commit', commit);
     try {
-      this.store.setRef(`refs/heads/${pull.base.ref}`, sha);
+      gitStore.setRef(`refs/heads/${pull.base.ref}`, sha);
     } catch {
       return { error: 'conflict' };
     }
-    pull.state = 'merged';
+    pull.state = 'closed';
     pull.merged = true;
     pull.merged_at = new Date().toISOString();
     pull.head.sha = headSha;

@@ -16,8 +16,17 @@ interface App {
   store: ForgeStore;
 }
 
+/**
+ * A per-request correlation id.
+ *
+ * The suite only requires a non-empty X-GitHub-Request-Id, so a monotonic counter mixed with a
+ * per-process random prefix is enough and avoids a CSPRNG call on every request — which the read
+ * benchmark pays thousands of times.
+ */
+let requestCounter = randomBytes(4).toString('hex');
 function requestId(): string {
-  return randomBytes(8).toString('hex');
+  requestCounter = (Number.parseInt(requestCounter.slice(-8), 16) + 1).toString(16).padStart(8, '0');
+  return `${PROCESS_PREFIX}${requestCounter}`;
 }
 
 function notFound(id: string): Response {
@@ -29,6 +38,9 @@ function notFound(id: string): Response {
     },
   });
 }
+
+/** A per-process prefix so ids from different runs do not collide. */
+const PROCESS_PREFIX = randomBytes(4).toString('hex');
 
 function repoExists(store: ForgeStore): boolean {
   return store.listRefs().length > 0;

@@ -23,6 +23,9 @@ if (ENV_URL === '') {
   process.exit(1);
 }
 
+/** The body of a request that carries none, so a read never allocates a Buffer. */
+const EMPTY_BODY = Buffer.alloc(0);
+
 /** How long one register or done request may take before it is abandoned and retried. */
 const REQUEST_TIMEOUT_MS = 30_000;
 /** The first wait between retries, and the longest. */
@@ -74,25 +77,48 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/**
+ * Adapts one node:http request to the fetch Request the app expects.
+ *
+ * The app only ever reads a request's method, url, headers and body, so this builds a plain object
+ * with that shape instead of a real fetch Request: constructing one costs two allocations and a
+ * header-map copy per call, which dominates a benchmark that issues thousands of small requests.
+ */
+function toRequest(req: IncomingMessage, body: Buffer): Request {
+  const method = req.method ?? 'GET';
+  const raw = req.headers;
+  const headers = {
+    get(name: string): string | null {
+      const value = raw[name.toLowerCase()];
+      if (typeof value === 'string') return value;
+      if (Array.isArray(value)) return value.join(',');
+      return null;
+    },
+  };
+
+  return {
+    method,
+    url: `http://127.0.0.1${req.url ?? '/'}`,
+    headers,
+    arrayBuffer: async (): Promise<ArrayBuffer> =>
+      body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer,
+    text: async (): Promise<string> => body.toString('utf8'),
+    json: async (): Promise<unknown> => JSON.parse(body.toString('utf8')),
+  } as unknown as Request;
+}
+
 /** Adapt one node:http request to a fetch Response, so the app stays framework-free. */
 async function handle(appFetch: (req: Request) => Promise<Response>, req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
-    const chunks: import('node:buffer').Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as import('node:buffer').Buffer);
-    const body = Buffer.concat(chunks);
-
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === 'string') headers.set(key, value);
-      else if (Array.isArray(value)) headers.set(key, value.join(','));
+    const method = req.method ?? 'GET';
+    let body = EMPTY_BODY;
+    if (method !== 'GET' && method !== 'HEAD') {
+      const chunks: import('node:buffer').Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as import('node:buffer').Buffer);
+      body = chunks.length === 0 ? EMPTY_BODY : Buffer.concat(chunks);
     }
 
-    const method = req.method ?? 'GET';
-    const request = new Request(`http://127.0.0.1${req.url ?? '/'}`, {
-      method,
-      headers,
-      body: method === 'GET' || method === 'HEAD' ? undefined : body,
-    });
+    const request = toRequest(req, body);
 
     const response = await appFetch(request);
     res.statusCode = response.status;

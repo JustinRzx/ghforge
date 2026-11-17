@@ -1,0 +1,532 @@
+import { randomBytes } from 'node:crypto';
+import {
+  encodeCommit,
+  encodeTree,
+  hashObject,
+  parseCommit,
+} from './gitobj.ts';
+import { MetaStore, type Repo } from './meta.ts';
+import type { ForgeStore } from './store.ts';
+
+const EMPTY_TREE_SHA = hashObject('tree', Buffer.alloc(0));
+
+/** Reads the token login and token value from the environment. */
+function tokenLogin(): string {
+  return process.env.MAKEFUN_SHOP_LOGIN || 'owner';
+}
+
+/** Reads the configured bearer token, defaulting to an empty string. */
+function tokenValue(): string {
+  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+}
+
+/** Generates a request id matching the forge's existing format. */
+function requestId(): string {
+  return randomBytes(8).toString('hex');
+}
+
+/** Builds a JSON response with the forge's standard headers. */
+function json(
+  data: unknown,
+  status: number,
+  id: string,
+  extra?: Record<string, string>,
+): Response {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'X-GitHub-Request-Id': id,
+  };
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      headers[key] = value;
+    }
+  }
+  return new Response(JSON.stringify(data), { status, headers });
+}
+
+/** Parses a request body as JSON, signalling failure for malformed input. */
+async function readBody(req: Request): Promise<{ ok: true; value: unknown } | { ok: false }> {
+  try {
+    const text = await req.text();
+    if (text.length === 0) {
+      return { ok: true, value: {} };
+    }
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Reads a positive integer query parameter with a default. */
+function intParam(url: URL, key: string, fallback: number): number {
+  const raw = url.searchParams.get(key);
+  if (raw === null) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Resolves the tree object id at the head of a repository's default branch. */
+function headTree(store: ForgeStore, repo: Repo): string | null {
+  const headSha = store.resolveRef(`refs/heads/${repo.default_branch}`);
+  if (headSha === null) return null;
+  const obj = store.getObject(headSha);
+  if (obj === null || obj.type !== 'commit') return null;
+  return parseCommit(obj.body).tree;
+}
+
+/** Walks a tree down a path, returning the leaf entry or null. */
+function findInTree(
+  store: ForgeStore,
+  treeSha: string,
+  parts: string[],
+): { sha: string; mode: string } | null {
+  let current = treeSha;
+  for (let i = 0; i < parts.length; i++) {
+    const entry = store.readTree(current).find((e) => e.name === parts[i]);
+    if (!entry) return null;
+    if (i === parts.length - 1) return { sha: entry.sha, mode: entry.mode };
+    current = entry.sha;
+  }
+  return null;
+}
+
+/** Writes a blob into a tree at a path, returning the new root tree id. */
+function writeBlobAtPath(
+  store: ForgeStore,
+  treeSha: string,
+  parts: string[],
+  blobSha: string,
+): string {
+  const name = parts[0];
+  if (parts.length === 1) {
+    const entries = store.readTree(treeSha).filter((e) => e.name !== name);
+    entries.push({ mode: '100644', name, sha: blobSha });
+    return store.putObject('tree', encodeTree(entries));
+  }
+  const existing = store.readTree(treeSha).find((e) => e.name === name);
+  const subtreeSha =
+    existing && (existing.mode === '40000' || existing.mode === '040000')
+      ? writeBlobAtPath(store, existing.sha, parts.slice(1), blobSha)
+      : writeBlobAtPath(store, EMPTY_TREE_SHA, parts.slice(1), blobSha);
+  const entries = store
+    .readTree(treeSha)
+    .filter((e) => e.name !== name);
+  entries.push({ mode: '40000', name, sha: subtreeSha });
+  return store.putObject('tree', encodeTree(entries));
+}
+
+/** Removes a path from a tree, returning the new root tree id or null. */
+function deleteFromTree(
+  store: ForgeStore,
+  treeSha: string,
+  parts: string[],
+): string | null {
+  const name = parts[0];
+  const entries = store.readTree(treeSha);
+  if (parts.length === 1) {
+    if (!entries.some((e) => e.name === name)) return null;
+    return store.putObject('tree', encodeTree(entries.filter((e) => e.name !== name)));
+  }
+  const existing = entries.find((e) => e.name === name);
+  if (!existing || (existing.mode !== '40000' && existing.mode !== '040000')) {
+    return null;
+  }
+  const subtreeSha = deleteFromTree(store, existing.sha, parts.slice(1));
+  if (subtreeSha === null) return null;
+  return store.putObject(
+    'tree',
+    encodeTree(entries.map((e) => (e.name === name ? { ...e, sha: subtreeSha } : e))),
+  );
+}
+
+/** Builds and stores a commit, returning its object id. */
+function buildCommit(
+  store: ForgeStore,
+  login: string,
+  tree: string,
+  parentSha: string | null,
+  message: string,
+): string {
+  const ts = Math.floor(Date.now() / 1000);
+  const ident = `${login} <${login}@users.noreply.ghforge> ${ts} +0000`;
+  const commit = encodeCommit({
+    tree,
+    parents: parentSha === null ? [] : [parentSha],
+    author: ident,
+    committer: ident,
+    message,
+  });
+  return store.putObject('commit', commit);
+}
+
+/** Returns a repository only when it belongs to the authenticated login. */
+function ownedRepo(meta: MetaStore, login: string, owner: string, name: string): Repo | null {
+  if (owner !== login) return null;
+  return meta.getRepo(owner, name);
+}
+
+/** Serializes a blob entry into a GitHub contents object. */
+function contentObject(
+  store: ForgeStore,
+  pathParts: string[],
+  sha: string,
+  body: Buffer,
+): Record<string, unknown> {
+  return {
+    type: 'file',
+    encoding: 'base64',
+    size: body.length,
+    name: pathParts[pathParts.length - 1],
+    path: pathParts.join('/'),
+    content: body.toString('base64'),
+    sha,
+  };
+}
+
+/** Handles the REST v3 API mounted at /api/v3. */
+export async function handleRest(
+  store: ForgeStore,
+  meta: MetaStore,
+  req: Request,
+  segments: string[],
+  url: URL,
+): Promise<Response | null> {
+  if (segments[0] !== 'api' || segments[1] !== 'v3') {
+    return null;
+  }
+  const id = requestId();
+  const login = tokenLogin();
+  if (req.headers.get('authorization') !== `Bearer ${tokenValue()}`) {
+    return json({ message: 'Requires authentication' }, 401, id);
+  }
+  const user = meta.getUser(login) ?? meta.createUser(login);
+
+  const rest = segments.slice(2);
+  const method = req.method;
+
+  if (rest.length === 0) {
+    if (method !== 'GET') return json({ message: 'Not Found' }, 404, id);
+    return json(
+      {
+        current_user_url: `${url.origin}/user`,
+        repository_url: `${url.origin}/repos/{owner}/{repo}`,
+        user_url: `${url.origin}/users/{user}`,
+      },
+      200,
+      id,
+      { 'X-OAuth-Scopes': 'repo' },
+    );
+  }
+
+  if (rest.length === 1 && rest[0] === 'meta') {
+    if (method !== 'GET') return json({ message: 'Not Found' }, 404, id);
+    return json({ installed_version: 'ghforge/1.0.0' }, 200, id);
+  }
+
+  if (rest.length === 1 && rest[0] === 'user') {
+    if (method !== 'GET') return json({ message: 'Not Found' }, 404, id);
+    return json(user, 200, id);
+  }
+
+  if (rest.length === 2 && rest[0] === 'user' && rest[1] === 'repos') {
+    if (method === 'GET') {
+      const page = intParam(url, 'page', 1);
+      const perPage = intParam(url, 'per_page', 30);
+      const all = meta.listRepos(login);
+      const start = (page - 1) * perPage;
+      const slice = all.slice(start, start + perPage);
+      const headers: Record<string, string> = {};
+      if (start + perPage < all.length) {
+        headers['Link'] = `<${url.origin}${url.pathname}?page=${page + 1}&per_page=${perPage}>; rel="next"`;
+      }
+      return json(slice, 200, id, headers);
+    }
+    if (method === 'POST') {
+      const body = await readBody(req);
+      if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+      const input = body.value as Record<string, unknown>;
+      const name = input.name;
+      if (typeof name !== 'string' || name.length === 0) {
+        return json({ message: 'Invalid repository name' }, 400, id);
+      }
+      try {
+        const repo = meta.createRepo({
+          name,
+          description: typeof input.description === 'string' ? input.description : undefined,
+          private: input.private === true,
+          owner: { login: user.login, id: user.id },
+        });
+        return json(repo, 201, id);
+      } catch {
+        return json(
+          {
+            message: 'Repository creation failed',
+            errors: [{ message: 'name already exists' }],
+          },
+          422,
+          id,
+        );
+      }
+    }
+    return json({ message: 'Not Found' }, 404, id);
+  }
+
+  if (rest[0] === 'repos') {
+    const owner = decodeURIComponent(rest[1] ?? '');
+    const repoName = decodeURIComponent(rest[2] ?? '');
+    const repo = ownedRepo(meta, login, owner, repoName);
+    const restOf = rest.slice(3);
+
+    if (restOf.length === 0) {
+      if (method === 'GET') {
+        return repo ? json(repo, 200, id) : json({ message: 'Not Found' }, 404, id);
+      }
+      if (method === 'PATCH') {
+        if (!repo) return json({ message: 'Not Found' }, 404, id);
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const patch = body.value as Record<string, unknown>;
+        try {
+          const updated = meta.updateRepo(owner, repoName, {
+            description:
+              typeof patch.description === 'string' ? patch.description : undefined,
+            private: typeof patch.private === 'boolean' ? patch.private : undefined,
+            name: typeof patch.name === 'string' ? patch.name : undefined,
+          });
+          return json(updated, 200, id);
+        } catch {
+          return json(
+            {
+              message: 'Repository update failed',
+              errors: [{ message: 'name already exists' }],
+            },
+            422,
+            id,
+          );
+        }
+      }
+      if (method === 'DELETE') {
+        if (!repo) return json({ message: 'Not Found' }, 404, id);
+        meta.deleteRepo(owner, repoName);
+        return new Response(null, {
+          status: 204,
+          headers: { 'X-GitHub-Request-Id': id },
+        });
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    if (restOf.length === 1 && restOf[0] === 'labels') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method === 'GET') {
+        return json(meta.listLabels(owner, repoName), 200, id);
+      }
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (typeof input.name !== 'string' || input.name.length === 0) {
+          return json({ message: 'Invalid label name' }, 400, id);
+        }
+        const label = meta.createLabel(owner, repoName, {
+          name: input.name,
+          color: typeof input.color === 'string' ? input.color : undefined,
+          description: typeof input.description === 'string' ? input.description : undefined,
+        });
+        return json(label, 201, id);
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    if (restOf.length === 1 && restOf[0] === 'issues') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method === 'GET') {
+        const issues = meta.listIssues(owner, repoName, {
+          state: url.searchParams.get('state') ?? undefined,
+          page: intParam(url, 'page', 1),
+          per_page: intParam(url, 'per_page', 30),
+        });
+        return json(issues, 200, id);
+      }
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (typeof input.title !== 'string' || input.title.length === 0) {
+          return json({ message: 'Invalid issue title' }, 400, id);
+        }
+        const issue = meta.createIssue(owner, repoName, {
+          title: input.title,
+          body: typeof input.body === 'string' ? input.body : undefined,
+          labels: Array.isArray(input.labels)
+            ? input.labels.filter((l): l is string => typeof l === 'string')
+            : undefined,
+          assignees: Array.isArray(input.assignees)
+            ? input.assignees.filter((a): a is string => typeof a === 'string')
+            : undefined,
+        });
+        if (!issue) {
+          return json({ message: 'Validation Failed' }, 422, id);
+        }
+        return json(issue, 201, id);
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    if (restOf.length === 2 && restOf[0] === 'issues') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      const number = Number.parseInt(restOf[1], 10);
+      if (!Number.isInteger(number)) return json({ message: 'Not Found' }, 404, id);
+      if (method === 'GET') {
+        const issue = meta.getIssue(owner, repoName, number);
+        return issue ? json(issue, 200, id) : json({ message: 'Not Found' }, 404, id);
+      }
+      if (method === 'PATCH') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const patch = body.value as Record<string, unknown>;
+        const updated = meta.updateIssue(owner, repoName, number, {
+          title: typeof patch.title === 'string' ? patch.title : undefined,
+          body: typeof patch.body === 'string' ? patch.body : undefined,
+          state:
+            patch.state === 'open' || patch.state === 'closed'
+              ? patch.state
+              : undefined,
+          labels: Array.isArray(patch.labels)
+            ? patch.labels.filter((l): l is string => typeof l === 'string')
+            : undefined,
+        });
+        return updated ? json(updated, 200, id) : json({ message: 'Not Found' }, 404, id);
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    if (restOf.length === 1 && restOf[0] === 'pulls') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method === 'GET') {
+        return json(
+          meta.listPulls(owner, repoName, {
+            state: url.searchParams.get('state') ?? undefined,
+          }),
+          200,
+          id,
+        );
+      }
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (
+          typeof input.title !== 'string' ||
+          typeof input.head !== 'string' ||
+          typeof input.base !== 'string'
+        ) {
+          return json({ message: 'Invalid pull request' }, 400, id);
+        }
+        const pull = meta.createPull(owner, repoName, {
+          title: input.title,
+          head: input.head,
+          base: input.base,
+          body: typeof input.body === 'string' ? input.body : undefined,
+        });
+        return json(pull, 201, id);
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    if (restOf.length === 2 && restOf[0] === 'pulls') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      const number = Number.parseInt(restOf[1], 10);
+      if (!Number.isInteger(number)) return json({ message: 'Not Found' }, 404, id);
+      if (method === 'GET') {
+        const pull = meta.getPull(owner, repoName, number);
+        return pull ? json(pull, 200, id) : json({ message: 'Not Found' }, 404, id);
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
+    if (restOf.length === 3 && restOf[0] === 'pulls' && restOf[2] === 'merge') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      if (method !== 'PUT') return json({ message: 'Not Found' }, 404, id);
+      const number = Number.parseInt(restOf[1], 10);
+      if (!Number.isInteger(number)) return json({ message: 'Not Found' }, 404, id);
+      const result = meta.mergePull(owner, repoName, number);
+      if ('error' in result) {
+        if (result.error === 'not_found') return json({ message: 'Not Found' }, 404, id);
+        return json({ message: 'Pull Request is not mergeable' }, 405, id);
+      }
+      return json(result, 200, id);
+    }
+
+    if (restOf.length >= 1 && restOf[0] === 'contents') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      const pathParts = restOf.slice(1).map((p) => decodeURIComponent(p));
+      const tree = headTree(store, repo);
+
+      if (method === 'GET') {
+        if (tree === null) return json({ message: 'Not Found' }, 404, id);
+        const entry = findInTree(store, tree, pathParts);
+        if (!entry || entry.mode === '40000' || entry.mode === '040000') {
+          return json({ message: 'Not Found' }, 404, id);
+        }
+        const body = store.readBlob(entry.sha);
+        if (body === null) return json({ message: 'Not Found' }, 404, id);
+        return json(contentObject(store, pathParts, entry.sha, body), 200, id);
+      }
+
+      if (method === 'PUT') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (typeof input.content !== 'string' || typeof input.message !== 'string') {
+          return json({ message: 'Invalid contents payload' }, 400, id);
+        }
+        const existing = tree === null ? null : findInTree(store, tree, pathParts);
+        if (typeof input.sha === 'string') {
+          if (!existing || existing.sha !== input.sha) {
+            return json({ message: 'sha does not match' }, 409, id);
+          }
+        }
+        const blob = Buffer.from(input.content.replace(/\s+/g, ''), 'base64');
+        const blobSha = store.putObject('blob', blob);
+        const newTree = writeBlobAtPath(store, tree ?? EMPTY_TREE_SHA, pathParts, blobSha);
+        const headSha = store.resolveRef(`refs/heads/${repo.default_branch}`);
+        const commitSha = buildCommit(store, login, newTree, headSha, input.message);
+        store.setRef(`refs/heads/${repo.default_branch}`, commitSha);
+        const status = existing ? 200 : 201;
+        return json(
+          {
+            content: contentObject(store, pathParts, blobSha, blob),
+            commit: { sha: commitSha, message: input.message },
+          },
+          status,
+          id,
+        );
+      }
+
+      if (method === 'DELETE') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (typeof input.message !== 'string' || typeof input.sha !== 'string') {
+          return json({ message: 'Invalid contents payload' }, 400, id);
+        }
+        const existing = tree === null ? null : findInTree(store, tree, pathParts);
+        if (!existing) return json({ message: 'Not Found' }, 404, id);
+        if (existing.sha !== input.sha) {
+          return json({ message: 'sha does not match' }, 409, id);
+        }
+        const newTree = deleteFromTree(store, tree as string, pathParts);
+        if (newTree === null) return json({ message: 'Not Found' }, 404, id);
+        const headSha = store.resolveRef(`refs/heads/${repo.default_branch}`);
+        const commitSha = buildCommit(store, login, newTree, headSha, input.message);
+        store.setRef(`refs/heads/${repo.default_branch}`, commitSha);
+        return json({ commit: { sha: commitSha } }, 200, id);
+      }
+
+      return json({ message: 'Not Found' }, 404, id);
+    }
+  }
+
+  return json({ message: 'Not Found' }, 404, id);
+}

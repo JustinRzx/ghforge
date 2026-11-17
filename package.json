@@ -1,0 +1,9 @@
+{
+  "name": "ghforge",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  }
+}

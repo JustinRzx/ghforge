@@ -514,6 +514,30 @@ export async function handleRest(
       return json({ message: 'Not Found' }, 404, id);
     }
 
+    // Comments on an issue: the REST surface gh uses for `gh issue comment`.
+    if (restOf.length === 3 && restOf[0] === 'issues' && restOf[2] === 'comments') {
+      if (!repo) return json({ message: 'Not Found' }, 404, id);
+      const number = Number.parseInt(restOf[1], 10);
+      if (!Number.isInteger(number)) return json({ message: 'Not Found' }, 404, id);
+      const issue = meta.getIssue(owner, repoName, number);
+      if (!issue) return json({ message: 'Not Found' }, 404, id);
+
+      if (method === 'GET') {
+        return json(meta.listIssueComments(owner, repoName, number), 200, id);
+      }
+      if (method === 'POST') {
+        const body = await readBody(req);
+        if (!body.ok) return json({ message: 'Problems parsing JSON' }, 400, id);
+        const input = body.value as Record<string, unknown>;
+        if (typeof input.body !== 'string' || input.body === '') {
+          return json({ message: 'Validation Failed' }, 422, id);
+        }
+        const comment = meta.createIssueComment(owner, repoName, number, input.body, login);
+        return comment ? json(comment, 201, id) : json({ message: 'Not Found' }, 404, id);
+      }
+      return json({ message: 'Not Found' }, 404, id);
+    }
+
     if (restOf.length === 1 && restOf[0] === 'pulls') {
       if (!repo) return json({ message: 'Not Found' }, 404, id);
       if (method === 'GET') {

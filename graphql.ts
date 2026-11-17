@@ -1,5 +1,5 @@
 import type { ForgeStore } from './store.ts';
-import type { MetaStoreInterface, Repo } from './meta.ts';
+import type { Issue, MetaStoreInterface, Pull, Repo } from './meta.ts';
 
 type TypeKind = 'SCALAR' | 'OBJECT' | 'ENUM' | 'LIST' | 'NON_NULL';
 
@@ -15,7 +15,7 @@ interface FieldDef {
 }
 
 interface TypeDef {
-  kind: 'OBJECT' | 'ENUM' | 'SCALAR';
+  kind: 'OBJECT' | 'ENUM' | 'SCALAR' | 'INPUT_OBJECT';
   name: string;
   fields?: FieldDef[];
   enumValues?: Array<{ name: string }>;
@@ -447,6 +447,51 @@ const REPOSITORY_TYPE: TypeDef = {
   ],
 };
 
+const INPUT_TYPES: TypeDef[] = [
+  {
+    kind: 'INPUT_OBJECT',
+    name: 'CreateIssueInput',
+    fields: [
+      fieldDef('repositoryId', nonNull(STRING)),
+      fieldDef('title', nonNull(STRING)),
+      fieldDef('body', STRING),
+      fieldDef('labelIds', listOf(nonNull(STRING))),
+    ],
+  },
+  {
+    kind: 'INPUT_OBJECT',
+    name: 'CloseIssueInput',
+    fields: [fieldDef('issueId', nonNull(STRING))],
+  },
+  {
+    kind: 'INPUT_OBJECT',
+    name: 'CreatePullRequestInput',
+    fields: [
+      fieldDef('repositoryId', nonNull(STRING)),
+      fieldDef('baseRefName', nonNull(STRING)),
+      fieldDef('headRefName', nonNull(STRING)),
+      fieldDef('title', nonNull(STRING)),
+      fieldDef('body', STRING),
+    ],
+  },
+  {
+    kind: 'INPUT_OBJECT',
+    name: 'MergePullRequestInput',
+    fields: [
+      fieldDef('pullRequestId', nonNull(STRING)),
+      fieldDef('mergeMethod', STRING),
+    ],
+  },
+  {
+    kind: 'INPUT_OBJECT',
+    name: 'AddCommentInput',
+    fields: [
+      fieldDef('subjectId', nonNull(STRING)),
+      fieldDef('body', nonNull(STRING)),
+    ],
+  },
+];
+
 const SEARCH_TYPE: TypeDef = {
   kind: 'ENUM',
   name: 'SearchType',
@@ -456,10 +501,14 @@ const SEARCH_TYPE: TypeDef = {
 const QUERY_TYPE: TypeDef = {
   kind: 'OBJECT',
   name: 'Query',
-  fields: [fieldDef('repository', namedType('OBJECT', 'Repository'))],
+  fields: [
+    fieldDef('repository', namedType('OBJECT', 'Repository')),
+    fieldDef('viewer', namedType('OBJECT', 'User')),
+  ],
 };
 
 const SCHEMA_TYPES: TypeDef[] = [
+  ...INPUT_TYPES,
   ISSUE_TYPE,
   PULL_REQUEST_TYPE,
   REPOSITORY_TYPE,
@@ -505,12 +554,51 @@ const INTERNAL_TYPES: TypeDef[] = [
   {
     kind: 'OBJECT',
     name: 'Mutation',
-    fields: [fieldDef('createPullRequest', namedType('OBJECT', 'CreatePullRequestPayload'))],
+    fields: [
+      fieldDef('createPullRequest', namedType('OBJECT', 'CreatePullRequestPayload')),
+      fieldDef('mergePullRequest', namedType('OBJECT', 'MergePullRequestPayload')),
+      fieldDef('createIssue', namedType('OBJECT', 'CreateIssuePayload')),
+      fieldDef('closeIssue', namedType('OBJECT', 'CloseIssuePayload')),
+      fieldDef('addComment', namedType('OBJECT', 'AddCommentPayload')),
+    ],
   },
   {
     kind: 'OBJECT',
     name: 'CreatePullRequestPayload',
     fields: [fieldDef('pullRequest', namedType('OBJECT', 'PullRequest'))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'MergePullRequestPayload',
+    fields: [fieldDef('pullRequest', namedType('OBJECT', 'PullRequest'))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'CreateIssuePayload',
+    fields: [fieldDef('issue', namedType('OBJECT', 'Issue'))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'CloseIssuePayload',
+    fields: [fieldDef('issue', namedType('OBJECT', 'Issue'))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'AddCommentPayload',
+    fields: [fieldDef('commentEdge', namedType('OBJECT', 'IssueCommentEdge'))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'IssueCommentEdge',
+    fields: [fieldDef('node', namedType('OBJECT', 'IssueComment'))],
+  },
+  {
+    kind: 'OBJECT',
+    name: 'IssueComment',
+    fields: [
+      fieldDef('id', nonNull(STRING)),
+      fieldDef('body', nonNull(STRING)),
+    ],
   },
   {
     kind: 'OBJECT',
@@ -555,9 +643,20 @@ const CONNECTION_ELEMENT_TYPES: Record<string, string> = {
   PullRequestConnection: 'PullRequest',
 };
 
+/**
+ * The login the bearer token acts as.
+ *
+ * The env passes only MAKEFUN_SHOP_TOKEN, never the login, so this falls back to the fixed
+ * scenario's viewer login (see api.ts FALLBACK_LOGIN) unless an override is set.
+ */
+const tokenLogin = (): string =>
+  process.env.MAKEFUN_SHOP_LOGIN || process.env.MAKEFUN_SHOP_OWNER || 'adaiversen';
+
 interface ExecContext {
   store: ForgeStore;
   meta: MetaStoreInterface;
+  /** The login the bearer token acts as: `viewer` resolves to this account. */
+  login: string;
   variables: Record<string, unknown>;
   fragments: Map<string, FragmentDefinition>;
 }
@@ -859,6 +958,60 @@ function connectionResult<T>(
 
 interface MetaInternals {
   repos?: Map<string, Repo>;
+  pulls?: Map<string, Pull>;
+  issues?: Map<string, Issue>;
+}
+
+/**
+ * Locates a pull request from the global id a mutation input carries.
+ *
+ * GitHub hands out opaque global ids; this forge mints `<owner>/<name>#<number>` shaped ones
+ * (see pullGlobalId), and falls back to scanning so an id minted any other way still resolves.
+ */
+function findPullById(meta: MetaStoreInterface, id: string): { owner: string; repo: string; number: number } | null {
+  const match = /^([^/]+)\/([^#]+)#(\d+)$/.exec(id);
+  if (match) {
+    const owner = match[1] as string;
+    const repo = match[2] as string;
+    const number = Number.parseInt(match[3] as string, 10);
+    if (meta.getPull(owner, repo, number)) return { owner, repo, number };
+  }
+  // The map key is `owner/repo/number`, so the owning repository comes from the key.
+  const internals = meta as unknown as MetaInternals;
+  if (internals.pulls instanceof Map) {
+    for (const [key, pull] of internals.pulls) {
+      if (pull.id === id) {
+        const parts = key.split('/');
+        const owner = parts[0] ?? '';
+        const repo = parts[1] ?? '';
+        if (owner && repo) return { owner, repo, number: pull.number };
+      }
+    }
+  }
+  return null;
+}
+
+/** Locates an issue from the global id a mutation input carries; same id shape as pulls. */
+function findIssueById(meta: MetaStoreInterface, id: string): { owner: string; repo: string; number: number } | null {
+  const match = /^([^/]+)\/([^#]+)#(\d+)$/.exec(id);
+  if (match) {
+    const owner = match[1] as string;
+    const repo = match[2] as string;
+    const number = Number.parseInt(match[3] as string, 10);
+    if (meta.getIssue(owner, repo, number)) return { owner, repo, number };
+  }
+  const internals = meta as unknown as MetaInternals;
+  if (internals.issues instanceof Map) {
+    for (const [key, issue] of internals.issues) {
+      if (issue.id === id) {
+        const parts = key.split('/');
+        const owner = parts[0] ?? '';
+        const repo = parts[1] ?? '';
+        if (owner && repo) return { owner, repo, number: issue.number };
+      }
+    }
+  }
+  return null;
 }
 
 function findRepoById(meta: MetaStoreInterface, id: string): Repo | null {
@@ -876,6 +1029,12 @@ function findRepoById(meta: MetaStoreInterface, id: string): Repo | null {
 }
 
 const RESOLVERS: Record<string, Resolver> = {
+  // gh opens almost every session with viewer { login }: it must be the login the token acts as.
+  'Query.viewer': (_parent, _args, context) => {
+    const login = context.login;
+    if (typeof login !== 'string' || login === '') return null;
+    return context.meta.getUser(login) ?? context.meta.createUser(login);
+  },
   'Query.repository': (_parent, args, context) => {
     const owner = typeof args.owner === 'string' ? args.owner : '';
     const name = typeof args.name === 'string' ? args.name : '';
@@ -945,6 +1104,77 @@ const RESOLVERS: Record<string, Resolver> = {
   },
   'PullRequest.merged': (parent: any) => Boolean(parent.merged),
   'PullRequest.files': (parent: any) => (Array.isArray(parent.files) ? parent.files : []),
+  'Mutation.mergePullRequest': (_parent, args, context) => {
+    const input = args.input;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return { pullRequest: null };
+    }
+    const values = input as Record<string, unknown>;
+    const pullId = typeof values.pullRequestId === 'string' ? values.pullRequestId : String(values.pullRequestId ?? '');
+    const located = findPullById(context.meta, pullId);
+    if (!located) return { pullRequest: null };
+    const result = context.meta.mergePull(located.owner, located.repo, located.number);
+    if ('error' in result) return { pullRequest: null };
+    return { pullRequest: context.meta.getPull(located.owner, located.repo, located.number) };
+  },
+
+  'Mutation.createIssue': (_parent, args, context) => {
+    const input = args.input;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return { issue: null };
+    }
+    const values = input as Record<string, unknown>;
+    const repositoryId = typeof values.repositoryId === 'string' ? values.repositoryId : String(values.repositoryId ?? '');
+    const repo = findRepoById(context.meta, repositoryId);
+    if (!repo) return { issue: null };
+    const title = typeof values.title === 'string' ? values.title : '';
+    if (title === '') return { issue: null };
+    const issue = context.meta.createIssue(repo.owner.login, repo.name, {
+      title,
+      body: typeof values.body === 'string' ? values.body : undefined,
+    });
+    return { issue };
+  },
+
+  'Mutation.closeIssue': (_parent, args, context) => {
+    const input = args.input;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return { issue: null };
+    }
+    const values = input as Record<string, unknown>;
+    const issueId = typeof values.issueId === 'string' ? values.issueId : String(values.issueId ?? '');
+    const located = findIssueById(context.meta, issueId);
+    if (!located) return { issue: null };
+    const issue = context.meta.updateIssue(located.owner, located.repo, located.number, { state: 'closed' });
+    return { issue };
+  },
+
+  'Mutation.addComment': (_parent, args, context) => {
+    const input = args.input;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return { commentEdge: null };
+    }
+    const values = input as Record<string, unknown>;
+    const subjectId = typeof values.subjectId === 'string' ? values.subjectId : String(values.subjectId ?? '');
+    const body = typeof values.body === 'string' ? values.body : '';
+    if (body === '') return { commentEdge: null };
+
+    // A comment subject is either an issue or a pull request; both are addressed by global id.
+    const issue = findIssueById(context.meta, subjectId);
+    if (issue) {
+      const comment = context.meta.createIssueComment(issue.owner, issue.repo, issue.number, body);
+      if (!comment) return { commentEdge: null };
+      return { commentEdge: { node: { id: comment.id, body: comment.body } } };
+    }
+    const pull = findPullById(context.meta, subjectId);
+    if (pull) {
+      const comment = context.meta.createIssueComment(pull.owner, pull.repo, pull.number, body);
+      if (!comment) return { commentEdge: null };
+      return { commentEdge: { node: { id: comment.id, body: comment.body } } };
+    }
+    return { commentEdge: null };
+  },
+
   'Mutation.createPullRequest': (_parent, args, context) => {
     const input = args.input;
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -1052,6 +1282,7 @@ export async function handleGraphQL(
     const context: ExecContext = {
       store,
       meta,
+      login: tokenLogin(),
       variables: buildVariables(operation, providedVariables),
       fragments,
     };

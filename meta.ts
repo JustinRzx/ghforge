@@ -36,6 +36,14 @@ export interface Label {
 }
 
 /** An issue record. */
+/** One comment on an issue or a pull request. */
+export interface IssueComment {
+  id: string;
+  body: string;
+  user: { login: string };
+  created_at: string;
+}
+
 export interface Issue {
   id: string;
   number: number;
@@ -148,6 +156,8 @@ export interface MetaStoreInterface {
   getPull(owner: string, repo: string, number: number): Pull | null;
   listPulls(owner: string, repo: string, input: ListPullsInput): Pull[];
   mergePull(owner: string, repo: string, number: number): MergePullResult;
+  createIssueComment(owner: string, repo: string, number: number, body: string, login?: string): IssueComment | null;
+  listIssueComments(owner: string, repo: string, number: number): IssueComment[];
   createUser(login: string): User;
   getUser(login: string): User | null;
 }
@@ -175,6 +185,9 @@ export class MetaStore implements MetaStoreInterface {
   private labels = new Map<string, Label>();
   private issues = new Map<string, Issue>();
   private pulls = new Map<string, Pull>();
+  /** Issue and pull-request comments, keyed by `owner/repo#number` and kept in insertion order. */
+  private comments = new Map<string, IssueComment[]>();
+  private commentSeq = 0;
   private users = new Map<string, User>();
   private issueNumbers = new Map<string, number>();
   private pullNumbers = new Map<string, number>();
@@ -374,6 +387,41 @@ export class MetaStore implements MetaStoreInterface {
   /** Returns an issue by number, or null. */
   getIssue(owner: string, repo: string, number: number): Issue | null {
     return this.issues.get(issueKey(owner, repo, number)) ?? null;
+  }
+
+  /**
+   * Adds a comment to an issue or a pull request.
+   *
+   * Both kinds of subject share one comment list, because GitHub's AddComment mutation addresses
+   * either by global id and the two never collide on `owner/repo#number`.
+   */
+  createIssueComment(
+    owner: string,
+    repo: string,
+    number: number,
+    body: string,
+    login = 'ghost',
+  ): IssueComment | null {
+    if (this.issues.get(issueKey(owner, repo, number)) === null && this.pulls.get(pullKey(owner, repo, number)) === null) {
+      return null;
+    }
+    this.commentSeq += 1;
+    const comment: IssueComment = {
+      id: `${owner}/${repo}#${number}/comment/${this.commentSeq}`,
+      body,
+      user: { login },
+      created_at: new Date().toISOString(),
+    };
+    const key = issueKey(owner, repo, number);
+    const existing = this.comments.get(key);
+    if (existing === undefined) this.comments.set(key, [comment]);
+    else existing.push(comment);
+    return comment;
+  }
+
+  /** Every comment on an issue or a pull request, oldest first. */
+  listIssueComments(owner: string, repo: string, number: number): IssueComment[] {
+    return (this.comments.get(issueKey(owner, repo, number)) ?? []).slice();
   }
 
   /** Lists issues with optional state filter and pagination. */

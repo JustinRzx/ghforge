@@ -213,7 +213,12 @@ export function handleInfoRefs(
   };
 }
 
-function collectReachable(store: ForgeStore, roots: Iterable<string>, depth = 0): Map<string, PackObject> {
+function collectReachable(
+  store: ForgeStore,
+  roots: Iterable<string>,
+  depth = 0,
+  boundaries: Set<string> = new Set(),
+): Map<string, PackObject> {
   const result = new Map<string, PackObject>();
   const seen = new Set<string>();
   const stack: Array<{ sha: string; level: number }> = [...roots].map((sha) => ({ sha, level: 0 }));
@@ -239,7 +244,10 @@ function collectReachable(store: ForgeStore, roots: Iterable<string>, depth = 0)
         continue;
       }
       stack.push({ sha: commit.tree, level: nextLevel });
-      if (depth === 0 || nextLevel < depth) {
+      // A commit the caller named as its own shallow boundary has no visible parent: the walk stops
+      // there, or a deepen would compute an empty pack because the client looks like it owns the
+      // whole history.
+      if (!boundaries.has(sha) && (depth === 0 || nextLevel < depth)) {
         for (const parent of commit.parents) {
           stack.push({ sha: parent, level: nextLevel });
         }
@@ -285,6 +293,18 @@ function shallowBoundary(store: ForgeStore, wants: string[], depth: number): str
   return boundary;
 }
 
+/** The `shallow <sha>` commits the caller declared as its own boundary. */
+function parseShallow(lines: string[]): Set<string> {
+  const result = new Set<string>();
+  for (const line of lines) {
+    if (line.startsWith('shallow ')) {
+      const sha = line.slice('shallow '.length).trim();
+      if (sha !== '') result.add(sha);
+    }
+  }
+  return result;
+}
+
 /** The `depth N` a fetch asked for, or 0 for a full fetch. */
 function requestedDepth(lines: string[]): number {
   for (const line of lines) {
@@ -322,9 +342,17 @@ function encodePackEntry(type: GitObjType, body: Buffer): Buffer {
   return Buffer.concat([Buffer.from(header), deflate(body)]);
 }
 
-function buildPack(store: ForgeStore, wants: string[], haves: string[], depth = 0): Buffer {
+function buildPack(
+  store: ForgeStore,
+  wants: string[],
+  haves: string[],
+  depth = 0,
+  boundaries: Set<string> = new Set(),
+): Buffer {
   const wanted = collectReachable(store, wants, depth);
-  const excluded = collectReachable(store, haves);
+  // What the caller already holds is bounded by the shallow boundaries it declared, not by the whole
+  // history behind its tips.
+  const excluded = collectReachable(store, haves, 0, boundaries);
   const objects = [...wanted.values()].filter((obj) => !excluded.has(obj.sha));
 
   const header = Buffer.alloc(12);
@@ -397,12 +425,18 @@ function buildFetchV2(store: ForgeStore, lines: string[]): Buffer {
   const wants = parseWantHave(lines, 'want');
   const haves = parseWantHave(lines, 'have');
   const depth = requestedDepth(lines);
-  const pack = buildPack(store, wants, haves, depth);
+  const boundaries = parseShallow(lines);
+  const pack = buildPack(store, wants, haves, depth, boundaries);
   const parts: Buffer[] = [];
   if (depth > 0) {
-    const boundary = shallowBoundary(store, wants, depth);
+    const next = shallowBoundary(store, wants, depth);
     parts.push(pktLine('shallow-info\n'));
-    for (const sha of boundary) {
+    // A boundary the caller no longer holds is explicitly unshallowed, and the commit that becomes
+    // the new cut is named, so the client knows exactly how far its history now reaches.
+    for (const sha of boundaries) {
+      if (!next.includes(sha)) parts.push(pktLine(`unshallow ${sha}\n`));
+    }
+    for (const sha of next) {
       parts.push(pktLine(`shallow ${sha}\n`));
     }
     parts.push(delimPkt());
@@ -415,10 +449,15 @@ function buildFetchV0(store: ForgeStore, lines: string[]): Buffer {
   const wants = parseWantHave(lines, 'want');
   const haves = parseWantHave(lines, 'have');
   const depth = requestedDepth(lines);
-  const pack = buildPack(store, wants, haves, depth);
+  const boundaries = parseShallow(lines);
+  const pack = buildPack(store, wants, haves, depth, boundaries);
   const parts: Buffer[] = [];
   if (depth > 0) {
-    for (const sha of shallowBoundary(store, wants, depth)) {
+    const next = shallowBoundary(store, wants, depth);
+    for (const sha of boundaries) {
+      if (!next.includes(sha)) parts.push(pktLine(`unshallow ${sha}\n`));
+    }
+    for (const sha of next) {
       parts.push(pktLine(`shallow ${sha}\n`));
     }
   }

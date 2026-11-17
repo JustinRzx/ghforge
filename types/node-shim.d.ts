@@ -23,6 +23,7 @@ declare class Buffer extends Uint8Array {
   static alloc(size: number): Buffer;
   static allocUnsafe(size: number): Buffer;
   static compare(a: Buffer, b: Buffer): number;
+  static byteLength(input: string | Buffer, encoding?: string): number;
   toString(encoding?: string, start?: number, end?: number): string;
   subarray(start?: number, end?: number): Buffer;
   slice(start?: number, end?: number): Buffer;

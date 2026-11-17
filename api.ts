@@ -8,6 +8,7 @@ import {
 import { MetaStore, type Repo } from './meta.ts';
 import type { Issue } from './meta.ts';
 import type { ForgeStore } from './store.ts';
+import { reply, type ForgeReply } from './reply.ts';
 
 const EMPTY_TREE_SHA = hashObject('tree', Buffer.alloc(0));
 
@@ -42,7 +43,7 @@ function json(
   status: number,
   id: string,
   extra?: Record<string, string>,
-): Response {
+): ForgeReply {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'X-GitHub-Request-Id': id,
@@ -52,7 +53,7 @@ function json(
       headers[key] = value;
     }
   }
-  return new Response(JSON.stringify(data), { status, headers });
+  return reply(status, headers, JSON.stringify(data));
 }
 
 /** Parses a request body as JSON, signalling failure for malformed input. */
@@ -370,7 +371,7 @@ export async function handleRest(
   req: Request,
   segments: string[],
   url: URL,
-): Promise<Response | null> {
+): Promise<Response | ForgeReply | null> {
   if (segments[0] !== 'api' || segments[1] !== 'v3') {
     return null;
   }

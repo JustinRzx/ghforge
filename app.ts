@@ -9,9 +9,10 @@ import { handleMcp } from './mcp.ts';
 import { handleGraphQL } from './graphql.ts';
 import { MetaStore } from './meta.ts';
 import { ForgeStore } from './store.ts';
+import { reply, type ForgeReply } from './reply.ts';
 
 interface App {
-  fetch(req: Request): Promise<Response>;
+  fetch(req: Request): Promise<Response | ForgeReply>;
   meta: MetaStore;
   store: ForgeStore;
 }
@@ -29,14 +30,11 @@ function requestId(): string {
   return `${PROCESS_PREFIX}${requestCounter}`;
 }
 
-function notFound(id: string): Response {
-  return new Response('{"message":"Not Found"}', {
-    status: 404,
-    headers: {
-      'content-type': 'application/json',
-      'X-GitHub-Request-Id': id,
-    },
-  });
+function notFound(id: string): ForgeReply {
+  return reply(404, {
+    'content-type': 'application/json',
+    'X-GitHub-Request-Id': id,
+  }, '{"message":"Not Found"}');
 }
 
 /** A per-process prefix so ids from different runs do not collide. */
@@ -53,20 +51,17 @@ export function createApp(store: ForgeStore): App {
   return {
     meta,
     store,
-    async fetch(req: Request): Promise<Response> {
+    async fetch(req: Request): Promise<Response | ForgeReply> {
       const id = requestId();
       const url = new URL(req.url);
       const segments = url.pathname.split('/').filter((part: string) => part.length > 0);
 
       // Boot check: the env calls this twice before it dials anything else.
       if (url.pathname === '/healthz' || url.pathname === '/healthz/') {
-        return new Response('{"ok":true}', {
-          status: 200,
-          headers: {
-            'content-type': 'application/json',
-            'X-GitHub-Request-Id': id,
-          },
-        });
+        return reply(200, {
+          'content-type': 'application/json',
+          'X-GitHub-Request-Id': id,
+        }, '{"ok":true}');
       }
 
       const rest = await handleRest(store, meta, req, segments, url);
@@ -105,13 +100,10 @@ export function createApp(store: ForgeStore): App {
           const protocol = req.headers.get('git-protocol') ?? '';
           const isV2 = protocol.includes('version=2');
           const result = handleInfoRefs(gitStore, owner, repoName, service, isV2);
-          return new Response(result.body, {
-            status: result.status,
-            headers: {
-              'content-type': result.contentType,
-              'X-GitHub-Request-Id': id,
-            },
-          });
+          return reply(result.status, {
+            'content-type': result.contentType,
+            'X-GitHub-Request-Id': id,
+          }, result.body);
         }
       }
 
@@ -123,16 +115,13 @@ export function createApp(store: ForgeStore): App {
             action === 'git-upload-pack'
               ? await handleUploadPack(gitStore, body)
               : await handleReceivePack(gitStore, body);
-          return new Response(result, {
-            status: 200,
-            headers: {
-              'content-type':
-                action === 'git-upload-pack'
-                  ? 'application/x-git-upload-pack-result'
-                  : 'application/x-git-receive-pack-result',
-              'X-GitHub-Request-Id': id,
-            },
-          });
+          return reply(200, {
+            'content-type':
+              action === 'git-upload-pack'
+                ? 'application/x-git-upload-pack-result'
+                : 'application/x-git-receive-pack-result',
+            'X-GitHub-Request-Id': id,
+          }, result);
         }
       }
       }

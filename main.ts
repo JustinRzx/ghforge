@@ -16,6 +16,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createApp } from './app.ts';
 import { ForgeStore } from './store.ts';
+import { isForgeReply, type ForgeReply } from './reply.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -111,7 +112,7 @@ function toRequest(req: IncomingMessage, body: Buffer): Request {
 }
 
 /** Adapt one node:http request to a fetch Response, so the app stays framework-free. */
-async function handle(appFetch: (req: Request) => Promise<Response>, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(appFetch: (req: Request) => Promise<Response | ForgeReply>, req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
     const method = req.method ?? 'GET';
     let body = EMPTY_BODY;
@@ -124,6 +125,20 @@ async function handle(appFetch: (req: Request) => Promise<Response>, req: Incomi
     const request = toRequest(req, body);
 
     const response = await appFetch(request);
+    // A reply the app built itself goes straight to the socket: status and headers in one call and
+    // the body handed over as-is. Going through a fetch Response instead would allocate a stream and
+    // copy the whole body a second time on every request, which a git pack makes expensive.
+    if (isForgeReply(response)) {
+      // content-length is stated so Node frames the body in one write instead of chunked encoding,
+      // which matters most on a git pack that can run to megabytes.
+      const body = response.body;
+      response.headers['content-length'] = String(
+        typeof body === 'string' ? Buffer.byteLength(body) : body.length,
+      );
+      res.writeHead(response.status, response.headers);
+      res.end(body);
+      return;
+    }
     res.statusCode = response.status;
     for (const [key, value] of response.headers) res.setHeader(key, value);
     res.end(Buffer.from(await response.arrayBuffer()));

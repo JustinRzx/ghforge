@@ -1,5 +1,5 @@
 import { encodeCommit, parseCommit } from './gitobj.ts';
-import type { ForgeStore } from './store.ts';
+import { ForgeStore } from './store.ts';
 
 /** A forge user record. */
 export interface User {
@@ -131,6 +131,7 @@ export type MergePullResult =
 
 /** The metadata store contract shared by REST and MCP surfaces. */
 export interface MetaStoreInterface {
+  repoStore(owner: string, name: string): ForgeStore;
   createRepo(input: CreateRepoInput): Repo;
   getRepo(owner: string, name: string): Repo | null;
   listRepos(owner: string): Repo[];
@@ -162,6 +163,14 @@ const pullKey = (owner: string, repo: string, number: number): string =>
 /** In-memory repository metadata: repos, labels, issues, pulls, and users. */
 export class MetaStore implements MetaStoreInterface {
   private store: ForgeStore;
+  /**
+   * One git object store per repository, keyed by `owner/name`.
+   *
+   * Git history must not leak between repositories: a suite that creates two repositories and
+   * pushes to one must not see those refs from the other. The constructor's store stays as the
+   * shared fallback so a caller that never creates a repository still has one to read.
+   */
+  private stores = new Map<string, ForgeStore>();
   private repos = new Map<string, Repo>();
   private labels = new Map<string, Label>();
   private issues = new Map<string, Issue>();
@@ -224,7 +233,37 @@ export class MetaStore implements MetaStoreInterface {
       has_issues: true,
     };
     this.repos.set(key, repo);
+
+    // Seed the default branch with a root commit over an empty tree, so the repository is
+    // clonable and its default_branch resolves before the first push.
+    const gitStore = this.repoStore(owner.login, input.name);
+    const emptyTree = gitStore.putObject('tree', Buffer.alloc(0));
+    const ident = this.ident(owner.login);
+    const rootCommit = gitStore.putObject(
+      'commit',
+      Buffer.from(`tree ${emptyTree}\nauthor ${ident}\ncommitter ${ident}\n\nInitial commit\n`),
+    );
+    gitStore.setRef('refs/heads/main', rootCommit);
+    gitStore.setRef('HEAD', 'ref: refs/heads/main');
+
     return repo;
+  }
+
+  /**
+   * The git object store that belongs to one repository.
+   *
+   * Every repository gets its own store on first use, so refs, objects and history stay isolated
+   * the way GitHub's do. An unknown repository also gets one: callers check `getRepo` first when
+   * absence matters.
+   */
+  repoStore(owner: string, name: string): ForgeStore {
+    const key = repoKey(owner, name);
+    let existing = this.stores.get(key);
+    if (existing === undefined) {
+      existing = new ForgeStore();
+      this.stores.set(key, existing);
+    }
+    return existing;
   }
 
   /** Returns a repository by owner and name, or null. */
@@ -388,8 +427,9 @@ export class MetaStore implements MetaStoreInterface {
     if (!this.repos.has(repoKey(owner, repo))) {
       return null;
     }
-    const headSha = this.store.resolveRef(`refs/heads/${input.head}`) ?? '';
-    const baseSha = this.store.resolveRef(`refs/heads/${input.base}`) ?? '';
+    const gitStore = this.repoStore(owner, repo);
+    const headSha = gitStore.resolveRef(`refs/heads/${input.head}`) ?? '';
+    const baseSha = gitStore.resolveRef(`refs/heads/${input.base}`) ?? '';
     const now = new Date().toISOString();
     const number = this.nextPullNumber(owner, repo);
     const pull: Pull = {

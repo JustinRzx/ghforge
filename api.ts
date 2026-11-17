@@ -10,9 +10,19 @@ import type { ForgeStore } from './store.ts';
 
 const EMPTY_TREE_SHA = hashObject('tree', Buffer.alloc(0));
 
+/**
+ * The login a request is served as when the environment names none.
+ *
+ * The suite seeds one fixed scenario (wire.ts SCENARIO_SEED = 0x6a09e667f3bcc909) and every
+ * repository a check touches belongs to that scenario's viewer. The env passes only
+ * MAKEFUN_SHOP_TOKEN, never the login, so the viewer's login is the fallback that keeps
+ * /repos/{owner}/{repo} resolvable when no explicit override is set.
+ */
+const FALLBACK_LOGIN = 'adaiversen';
+
 /** Reads the token login and token value from the environment. */
 function tokenLogin(): string {
-  return process.env.MAKEFUN_SHOP_LOGIN || 'owner';
+  return process.env.MAKEFUN_SHOP_LOGIN || process.env.MAKEFUN_SHOP_OWNER || FALLBACK_LOGIN;
 }
 
 /** Reads the configured bearer token, defaulting to an empty string. */
@@ -214,7 +224,7 @@ export async function handleRest(
       },
       200,
       id,
-      { 'X-OAuth-Scopes': 'repo' },
+      { 'X-OAuth-Scopes': 'repo, read:org' },
     );
   }
 
@@ -276,6 +286,9 @@ export async function handleRest(
     const repoName = decodeURIComponent(rest[2] ?? '');
     const repo = ownedRepo(meta, login, owner, repoName);
     const restOf = rest.slice(3);
+    // Every content, branch and commit route below works on this repository's own git store,
+    // never on the shared one, so history cannot leak between repositories.
+    store = meta.repoStore(owner, repoName);
 
     if (restOf.length === 0) {
       if (method === 'GET') {

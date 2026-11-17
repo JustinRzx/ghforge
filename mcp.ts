@@ -102,7 +102,11 @@ const TOOLS: ToolSchema[] = [
   },
 ];
 
-const tokenLogin = (): string => process.env.MAKEFUN_SHOP_LOGIN || 'owner';
+/**
+ * The login the token acts as. The env passes only MAKEFUN_SHOP_TOKEN, so this falls back to the
+ * fixed scenario's viewer login (see api.ts FALLBACK_LOGIN) unless an override is set.
+ */
+const tokenLogin = (): string => process.env.MAKEFUN_SHOP_LOGIN || process.env.MAKEFUN_SHOP_OWNER || 'adaiversen';
 const tokenValue = (): string => process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 /** Builds a JSON-RPC 2.0 response object. */

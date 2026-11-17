@@ -1,9 +1,15 @@
 {
   "name": "ghforge",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
+  "description": "A GitHub-compatible forge: smart HTTP v2, REST v3, GraphQL and MCP over one in-memory object store",
   "license": "MIT",
   "engines": {
     "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

@@ -46,6 +46,17 @@ export function createApp(store: ForgeStore): App {
       const url = new URL(req.url);
       const segments = url.pathname.split('/').filter((part: string) => part.length > 0);
 
+      // Boot check: the env calls this twice before it dials anything else.
+      if (url.pathname === '/healthz' || url.pathname === '/healthz/') {
+        return new Response('{"ok":true}', {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'X-GitHub-Request-Id': id,
+          },
+        });
+      }
+
       const rest = await handleRest(store, meta, req, segments, url);
       if (rest !== null) {
         return rest;
@@ -62,6 +73,16 @@ export function createApp(store: ForgeStore): App {
       const repoExistsAtPath =
         segments.length >= 2 && segments[1].endsWith('.git');
 
+      if (repoExistsAtPath) {
+        const owner = decodeURIComponent(segments[0] as string);
+        const repoName = decodeURIComponent((segments[1] as string).slice(0, -4));
+        // Git speaks only to repositories this forge knows, through that repository's own store.
+        const known = meta.getRepo(owner, repoName) !== null;
+        const gitStore = known ? meta.repoStore(owner, repoName) : store;
+        if (!known) {
+          return notFound(id);
+        }
+
       if (req.method === 'GET' && segments.length === 4 && repoExistsAtPath) {
         const [, repoName, area, action] = segments;
         if (area === 'info' && action === 'refs') {
@@ -69,14 +90,9 @@ export function createApp(store: ForgeStore): App {
           if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
             return notFound(id);
           }
-          if (!repoExistsAtPath || !repoExists(store)) {
-            return notFound(id);
-          }
-          const owner = decodeURIComponent(segments[0]);
-          const repo = decodeURIComponent(repoName.slice(0, -4));
           const protocol = req.headers.get('git-protocol') ?? '';
           const isV2 = protocol.includes('version=2');
-          const result = handleInfoRefs(store, owner, repo, service, isV2);
+          const result = handleInfoRefs(gitStore, owner, repoName, service, isV2);
           return new Response(result.body, {
             status: result.status,
             headers: {
@@ -90,14 +106,11 @@ export function createApp(store: ForgeStore): App {
       if (req.method === 'POST' && segments.length === 3 && repoExistsAtPath) {
         const action = segments[2];
         if (action === 'git-upload-pack' || action === 'git-receive-pack') {
-          if (!repoExists(store)) {
-            return notFound(id);
-          }
           const body = Buffer.from(await req.arrayBuffer());
           const result =
             action === 'git-upload-pack'
-              ? await handleUploadPack(store, body)
-              : await handleReceivePack(store, body);
+              ? await handleUploadPack(gitStore, body)
+              : await handleReceivePack(gitStore, body);
           return new Response(result, {
             status: 200,
             headers: {
@@ -109,6 +122,7 @@ export function createApp(store: ForgeStore): App {
             },
           });
         }
+      }
       }
 
       return notFound(id);

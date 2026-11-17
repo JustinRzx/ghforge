@@ -898,12 +898,12 @@ const RESOLVERS: Record<string, Resolver> = {
   'Repository.name': (parent: Repo) => parent.name,
   'Repository.nameWithOwner': (parent: Repo) => parent.full_name,
   'Repository.owner': (parent: Repo) => parent.owner,
-  'Repository.defaultBranchRef': (_parent: Repo, _args, context) => ({
-    name: 'main',
+  'Repository.defaultBranchRef': (parent: Repo, _args, context) => ({
+    name: parent.default_branch,
     target: {
+      // The ref lives in this repository's own store, not the shared one.
       oid:
-        context.store.resolveRef('refs/heads/main') ??
-        context.store.getRef('refs/heads/main') ??
+        context.meta.repoStore(parent.owner.login, parent.name).resolveRef(`refs/heads/${parent.default_branch}`) ??
         '',
     },
   }),

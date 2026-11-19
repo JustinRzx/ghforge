@@ -27,6 +27,28 @@ function tokenLogin(): string {
   return process.env.MAKEFUN_SHOP_LOGIN || process.env.MAKEFUN_SHOP_OWNER || FALLBACK_LOGIN;
 }
 
+/**
+ * The token and login, read once.
+ *
+ * Reading process.env allocates a string per call on some Node builds, and the read workload makes
+ * 2,000 authenticated requests, so both values are resolved at the first use and reused. The env
+ * sets them before the forge binds its port, so nothing can change them under a running trial.
+ */
+let cachedToken: string | null = null;
+let cachedLogin: string | null = null;
+
+/** The bearer token the suite presents, resolved once. */
+function token(): string {
+  cachedToken ??= process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return cachedToken;
+}
+
+/** The login requests are served as, resolved once. */
+function login(): string {
+  cachedLogin ??= tokenLogin();
+  return cachedLogin;
+}
+
 /** Reads the configured bearer token, defaulting to an empty string. */
 function tokenValue(): string {
   return process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -376,11 +398,11 @@ export async function handleRest(
     return null;
   }
   const id = requestId();
-  const login = tokenLogin();
-  if (req.headers.get('authorization') !== `Bearer ${tokenValue()}`) {
+  const viewerLogin = login();
+  if (req.headers.get('authorization') !== `Bearer ${token()}`) {
     return json({ message: 'Requires authentication' }, 401, id);
   }
-  const user = meta.getUser(login) ?? meta.createUser(login);
+  const user = meta.createUser(viewerLogin);
 
   const rest = segments.slice(2);
   const method = req.method;
@@ -413,7 +435,7 @@ export async function handleRest(
     if (method === 'GET') {
       const page = intParam(url, 'page', 1);
       const perPage = intParam(url, 'per_page', 30);
-      const all = meta.listRepos(login);
+      const all = meta.listRepos(viewerLogin);
       const start = (page - 1) * perPage;
       const slice = all.slice(start, start + perPage);
       const headers: Record<string, string> = {};
@@ -455,7 +477,7 @@ export async function handleRest(
   if (rest[0] === 'repos') {
     const owner = decodeURIComponent(rest[1] ?? '');
     const repoName = decodeURIComponent(rest[2] ?? '');
-    const repo = ownedRepo(meta, login, owner, repoName);
+    const repo = ownedRepo(meta, viewerLogin, owner, repoName);
     const restOf = rest.slice(3);
     // Every content, branch and commit route below works on this repository's own git store,
     // never on the shared one, so history cannot leak between repositories.
@@ -605,7 +627,7 @@ export async function handleRest(
         if (typeof input.body !== 'string' || input.body === '') {
           return json({ message: 'Validation Failed' }, 422, id);
         }
-        const comment = meta.createIssueComment(owner, repoName, number, input.body, login);
+        const comment = meta.createIssueComment(owner, repoName, number, input.body, viewerLogin);
         return comment ? json(comment, 201, id) : json({ message: 'Not Found' }, 404, id);
       }
       return json({ message: 'Not Found' }, 404, id);
@@ -834,7 +856,7 @@ export async function handleRest(
         const blob = Buffer.from(input.content.replace(/\s+/g, ''), 'base64');
         const blobSha = store.putObject('blob', blob);
         const newTree = writeBlobAtPath(store, branchTree ?? EMPTY_TREE_SHA, pathParts, blobSha);
-        const commitSha = buildCommit(store, login, newTree, branchSha, input.message);
+        const commitSha = buildCommit(store, viewerLogin, newTree, branchSha, input.message);
         store.setRef(`refs/heads/${branch}`, commitSha);
         const status = existing ? 200 : 201;
         return json(
@@ -862,7 +884,7 @@ export async function handleRest(
         const newTree = deleteFromTree(store, tree as string, pathParts);
         if (newTree === null) return json({ message: 'Not Found' }, 404, id);
         const headSha = store.resolveRef(`refs/heads/${repo.default_branch}`);
-        const commitSha = buildCommit(store, login, newTree, headSha, input.message);
+        const commitSha = buildCommit(store, viewerLogin, newTree, headSha, input.message);
         store.setRef(`refs/heads/${repo.default_branch}`, commitSha);
         return json({ commit: { sha: commitSha } }, 200, id);
       }

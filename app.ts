@@ -64,9 +64,13 @@ export function createApp(store: ForgeStore): App {
         }, '{"ok":true}');
       }
 
-      const rest = await handleRest(store, meta, req, segments, url);
-      if (rest !== null) {
-        return rest;
+      // Git and MCP never live under /api, so answer REST only when the path can be one. Trying REST
+      // first on a git pack costs a router call and a path slice on the surface a clone hammers.
+      if (segments[0] === 'api' && segments[1] === 'v3') {
+        const rest = await handleRest(store, meta, req, segments, url);
+        if (rest !== null) {
+          return rest;
+        }
       }
 
       if (segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) {

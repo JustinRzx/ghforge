@@ -1,0 +1,8 @@
+# Benchmarks, probes and the local trial runner: development tools, not part of the entry.
+bench-*.mjs
+probe.mjs
+mock-env.mjs
+run-bench.sh
+run-probe.sh
+run-trial.sh
+local-trial.sh
